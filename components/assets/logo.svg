@@ -1,0 +1,23 @@
+<svg width="96" height="96" viewBox="0 0 96 96" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AgentForge AI engineer logo">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="10" x2="82" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF4FF"/>
+      <stop offset="1" stop-color="#F4ECFF"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="26" y1="30" x2="70" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+  </defs>
+  <circle cx="48" cy="48" r="46" fill="url(#bg)" stroke="white" stroke-width="4"/>
+  <circle cx="48" cy="38" r="15" fill="#F3C7A6"/>
+  <path d="M31 75c2.5-13.5 11.2-21 17-21s14.5 7.5 17 21H31Z" fill="#172033"/>
+  <path d="M30 37c2.2-12.2 10-18 18.5-18 9.6 0 16.8 6.2 18 18.2-5.4-4-11.2-6-17.5-6-6.8 0-13 1.9-19 5.8Z" fill="#182235"/>
+  <path d="M25 48c0-4.2 2.8-7.5 6.7-8.3v15.8C27.8 55 25 51.9 25 48Z" fill="#2563EB"/>
+  <path d="M71 39.7c3.9.8 6.7 4.1 6.7 8.3S74.8 55 71 55.5V39.7Z" fill="#2563EB"/>
+  <rect x="36" y="41" width="24" height="10" rx="5" fill="white" fill-opacity=".9"/>
+  <circle cx="43" cy="46" r="2" fill="#2563EB"/>
+  <circle cx="53" cy="46" r="2" fill="#2563EB"/>
+  <path d="M61 56c5.7-.5 9.7-3 12-7.5" stroke="url(#accent)" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="74" cy="47" r="3" fill="#7C3AED"/>
+</svg>
