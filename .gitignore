@@ -20,6 +20,7 @@ node_modules/
 
 # Local backups / generated artifacts
 backups/
+task_uploads/
 .DS_Store
 
 # OS / editor noise

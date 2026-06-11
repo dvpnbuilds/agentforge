@@ -8,7 +8,10 @@ PRAGMA query_only=1. The only writable database is ./board.db.
 
 from __future__ import annotations
 
+import cgi
+import io
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -30,17 +33,25 @@ LIBRARY_AGENTS = ["master", "assistant", "research", "planning", "audit", "dev"]
 AGENT_LOGS_DB = HERMES_HOME / "agent-logs.db"
 STATE_DB = HERMES_HOME / "state.db"
 BOARD_DB = PROJECT_DIR / "board.db"
-TASK_STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"]
+TASK_ATTACHMENTS_DIR = PROJECT_DIR / "task_uploads"
+TASK_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+TASK_ATTACHMENT_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".rtf", ".odt"}
+TASK_ATTACHMENT_ALLOWED_MIME_PREFIXES = ("image/", "text/")
+TASK_ATTACHMENT_ALLOWED_MIME_TYPES = {"application/pdf", "application/json", "application/msword", "application/rtf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.oasis.opendocument.text"}
+TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
-TASK_STATUS_ALIASES = {"pending": "backlog", "completed": "done"}
+TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
 DEPLOYMENT_TYPES = ["hermes_profile", "local_worker", "vps_worker", "webhook", "external"]
 DEPLOYMENT_TRIGGER_MODES = ["manual", "task_driven", "schedule", "webhook"]
 DEPLOYMENT_STATUSES = ["draft", "ready", "inactive"]
 RUN_TYPES = ["task_run", "deployment", "sync", "agent_execution", "evaluation"]
-RUN_STATUSES = ["queued", "running", "success", "failed"]
+RUN_STATUSES = ["queued", "running", "completed", "failed", "cancelled", "success"]
+RUN_STATUS_ALIASES = {"complete": "completed", "completed": "completed", "succeeded": "completed", "success": "success", "canceled": "cancelled", "cancelled": "cancelled"}
 RUN_ORIGINS = ["seed", "live"]
-RUN_SOURCES = ["user", "system", "demo", "verification", "runtime"]
-RUN_PURPOSES = ["task_lifecycle", "deployment_lifecycle", "agent_lifecycle", "agent_execution", "evaluation", "smoke_test", "demo_seed"]
+RUN_SOURCES = ["user", "system", "verification", "runtime", "deployment", "task", "unknown"]
+RUN_SOURCE_ALIASES = {"demo": "system", "operator": "user"}
+RUN_PURPOSES = ["execution", "test", "smoke_test", "cleanup", "verification", "retry", "diagnostic", "unknown"]
+RUN_PURPOSE_ALIASES = {"task_lifecycle": "diagnostic", "deployment_lifecycle": "diagnostic", "agent_lifecycle": "diagnostic", "agent_execution": "execution", "evaluation": "execution", "demo_seed": "test", "task_execution": "execution"}
 RUN_TRACE_EVENT_TYPES = ["queued", "planning", "tool_selection", "tool_execution", "result_assembly", "completed", "failed", "step"]
 RUN_TRACE_STATUSES = ["pending", "running", "success", "failed", "skipped"]
 RUN_OUTPUT_STATUSES = ["pending", "running", "success", "failed", "partial", "empty"]
@@ -127,6 +138,214 @@ def dump_json_object(value) -> str:
 
 def decode_json_object(value) -> dict:
     return parse_json_object(value)
+
+
+def sanitize_task_filename(filename: str, fallback: str = "attachment") -> str:
+    raw = Path(str(filename or fallback)).name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-._")
+    return stem[:180] or fallback
+
+
+def guess_task_attachment_mime_type(filename: str, provided: str = "") -> str:
+    clean = str(provided or '').split(';', 1)[0].strip().lower()
+    if clean:
+        return clean
+    guessed, _ = mimetypes.guess_type(str(filename or ''))
+    return str(guessed or 'application/octet-stream').lower()
+
+
+def task_attachment_allowed(filename: str, mime_type: str) -> bool:
+    suffix = Path(str(filename or '')).suffix.lower()
+    if suffix and suffix in TASK_ATTACHMENT_ALLOWED_EXTENSIONS:
+        return True
+    if any(str(mime_type or '').startswith(prefix) for prefix in TASK_ATTACHMENT_ALLOWED_MIME_PREFIXES):
+        return True
+    return str(mime_type or '') in TASK_ATTACHMENT_ALLOWED_MIME_TYPES
+
+
+def task_attachments_root() -> Path:
+    TASK_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    return TASK_ATTACHMENTS_DIR
+
+
+def task_attachment_absolute_path(storage_rel_path: str) -> Path:
+    if not storage_rel_path:
+        raise ValueError('attachment storage path is missing')
+    candidate = (task_attachments_root() / str(storage_rel_path).lstrip('/')).resolve(strict=False)
+    root = task_attachments_root().resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError('attachment path escapes storage root') from exc
+    return candidate
+
+
+def delete_task_attachment_file(storage_rel_path: str):
+    try:
+        path = task_attachment_absolute_path(storage_rel_path)
+    except Exception:
+        return
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+    parent = path.parent
+    root = task_attachments_root().resolve(strict=False)
+    for _ in range(4):
+        try:
+            if parent == root or not parent.exists():
+                break
+            parent.rmdir()
+            parent = parent.parent
+        except OSError:
+            break
+
+
+def normalize_task_attachment_row(row) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    item['id'] = str(item.get('id') or '')
+    item['task_id'] = str(item.get('task_id') or '')
+    item['draft_token'] = str(item.get('draft_token') or '')
+    item['filename'] = str(item.get('filename') or '')
+    item['mime_type'] = str(item.get('mime_type') or '').lower()
+    item['size_bytes'] = int(item.get('size_bytes') or 0)
+    item['size'] = item['size_bytes']
+    item['storage_path'] = str(item.get('storage_rel_path') or '')
+    item['storage_rel_path'] = item['storage_path']
+    item['uploaded_at'] = str(item.get('uploaded_at') or item.get('created_at') or '')
+    item['created_at'] = str(item.get('created_at') or item['uploaded_at'] or '')
+    item['updated_at'] = str(item.get('updated_at') or item['uploaded_at'] or '')
+    item['download_url'] = f"/api/task-attachments/{item['id']}/content" if item['id'] else ''
+    item['preview_url'] = item['download_url']
+    item['is_image'] = item['mime_type'].startswith('image/')
+    item['is_pdf'] = item['mime_type'] == 'application/pdf'
+    item['is_text'] = item['mime_type'].startswith('text/') or item['mime_type'] in {'application/json'}
+    return item
+
+
+def parse_task_attachment_ids(value) -> list[str]:
+    ids = []
+    seen = set()
+    if isinstance(value, (list, tuple, set)):
+        source = value
+    else:
+        source = parse_json_list(value)
+    for item in source:
+        if isinstance(item, dict):
+            clean = str(item.get('id') or '').strip()
+        else:
+            clean = str(item).strip()
+        if clean and clean not in seen:
+            ids.append(clean)
+            seen.add(clean)
+    return ids
+
+
+def task_attachment_rows_for_ids(conn: sqlite3.Connection, attachment_ids: list[str]) -> list[dict]:
+    if not attachment_ids:
+        return []
+    placeholders = ','.join(['?'] * len(attachment_ids))
+    rows = conn.execute(f"SELECT * FROM task_attachments WHERE id IN ({placeholders}) ORDER BY uploaded_at ASC, created_at ASC", attachment_ids).fetchall()
+    found = {str(row['id']) for row in rows}
+    missing = [attachment_id for attachment_id in attachment_ids if attachment_id not in found]
+    if missing:
+        raise ValueError(f"unknown attachment IDs: {', '.join(missing)}")
+    by_id = {str(row['id']): dict(row) for row in rows}
+    return [by_id[attachment_id] for attachment_id in attachment_ids]
+
+
+def task_attachments_for_task(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC",
+        (task_id,),
+    ).fetchall()
+    return [normalize_task_attachment_row(row) for row in rows]
+
+
+def delete_task_attachment_rows(conn: sqlite3.Connection, rows):
+    for row in rows or []:
+        item = dict(row)
+        if item.get('storage_rel_path'):
+            delete_task_attachment_file(str(item.get('storage_rel_path') or ''))
+        if item.get('id'):
+            conn.execute('DELETE FROM task_attachments WHERE id = ?', (str(item.get('id')),))
+
+
+def sync_task_attachments(conn: sqlite3.Connection, task_id: str, attachment_ids: list[str], draft_token: str = ''):
+    keep_ids = [attachment_id for attachment_id in attachment_ids if attachment_id]
+    keep_set = set(keep_ids)
+    current_rows = conn.execute('SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC', (task_id,)).fetchall()
+    delete_task_attachment_rows(conn, [row for row in current_rows if str(row['id']) not in keep_set])
+    now = utc_now()
+    for attachment_id in keep_ids:
+        conn.execute(
+            "UPDATE task_attachments SET task_id = ?, draft_token = '', updated_at = ? WHERE id = ?",
+            (task_id, now, attachment_id),
+        )
+    if draft_token:
+        staged_rows = conn.execute("SELECT * FROM task_attachments WHERE COALESCE(task_id, '') = '' AND draft_token = ?", (draft_token,)).fetchall()
+        delete_task_attachment_rows(conn, [row for row in staged_rows if str(row['id']) not in keep_set])
+
+
+def task_attachment_create(file_bytes: bytes, filename: str, mime_type: str = '', draft_token: str = '', task_id: str = '') -> dict:
+    safe_name = sanitize_task_filename(filename)
+    detected_mime = guess_task_attachment_mime_type(safe_name, mime_type)
+    if not task_attachment_allowed(safe_name, detected_mime):
+        raise ValueError('unsupported file type')
+    size_bytes = len(file_bytes or b'')
+    if size_bytes <= 0:
+        raise ValueError('attachment file is empty')
+    if size_bytes > TASK_ATTACHMENT_MAX_BYTES:
+        raise ValueError(f'attachment exceeds {TASK_ATTACHMENT_MAX_BYTES // (1024 * 1024)}MB limit')
+    attachment_id = uuid.uuid4().hex
+    token = str(draft_token or '').strip()
+    normalized_task_id = str(task_id or '').strip()
+    bucket = normalized_task_id or token or 'direct'
+    rel_path = f"{bucket}/{attachment_id}-{safe_name}"
+    abs_path = task_attachment_absolute_path(rel_path)
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_bytes(file_bytes)
+    now = utc_now()
+    with connect_board() as conn:
+        if normalized_task_id and not task_exists(conn, 'tasks', normalized_task_id):
+            delete_task_attachment_file(rel_path)
+            raise ValueError('task_id does not match an existing task')
+        conn.execute(
+            """
+            INSERT INTO task_attachments (
+              id, task_id, draft_token, filename, mime_type, size_bytes, storage_rel_path, uploaded_at, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (attachment_id, normalized_task_id, '' if normalized_task_id else token, safe_name, detected_mime, size_bytes, rel_path, now, now, now),
+        )
+        row = conn.execute('SELECT * FROM task_attachments WHERE id = ?', (attachment_id,)).fetchone()
+        conn.commit()
+    return normalize_task_attachment_row(row)
+
+
+def task_attachment_get(attachment_id: str) -> dict:
+    if not attachment_id:
+        raise ValueError('attachment id is required')
+    with connect_board() as conn:
+        row = conn.execute('SELECT * FROM task_attachments WHERE id = ?', (attachment_id,)).fetchone()
+        if row is None:
+            raise KeyError('attachment not found')
+        return normalize_task_attachment_row(row)
+
+
+def task_attachment_delete(attachment_id: str):
+    if not attachment_id:
+        raise ValueError('attachment id is required')
+    with connect_board() as conn:
+        row = conn.execute('SELECT * FROM task_attachments WHERE id = ?', (attachment_id,)).fetchone()
+        if row is None:
+            raise KeyError('attachment not found')
+        delete_task_attachment_rows(conn, [row])
+        conn.commit()
+        return {'deleted': 1, 'id': attachment_id}
 
 
 def file_size_mb(path: Path) -> float:
@@ -846,6 +1065,8 @@ def init_board():
               playbook_id TEXT DEFAULT '',
               blocked_reason TEXT DEFAULT '',
               notes TEXT DEFAULT '',
+              result_text TEXT DEFAULT '',
+              last_note TEXT DEFAULT '',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
@@ -861,6 +1082,34 @@ def init_board():
             CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dependencies_unique
             ON task_dependencies(task_id, depends_on_task_id)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_attachments (
+              id TEXT PRIMARY KEY,
+              task_id TEXT DEFAULT '',
+              draft_token TEXT DEFAULT '',
+              filename TEXT NOT NULL,
+              mime_type TEXT DEFAULT '',
+              size_bytes INTEGER NOT NULL DEFAULT 0,
+              storage_rel_path TEXT NOT NULL,
+              uploaded_at TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_attachments_task_id ON task_attachments(task_id, uploaded_at, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_attachments_draft_token ON task_attachments(draft_token, uploaded_at, created_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              task_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              message TEXT NOT NULL,
+              note TEXT DEFAULT '',
+              metadata_json TEXT DEFAULT '{}',
+              created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id, created_at, id)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS playbooks (
               id TEXT PRIMARY KEY,
@@ -944,6 +1193,12 @@ def init_board():
               trigger_label TEXT DEFAULT '',
               changed_fields_json TEXT DEFAULT '[]',
               metadata_json TEXT DEFAULT '{}',
+              task_title_snapshot TEXT DEFAULT '',
+              assignee_id TEXT DEFAULT '',
+              assignee_name TEXT DEFAULT '',
+              playbook_id TEXT DEFAULT '',
+              playbook_name TEXT DEFAULT '',
+              result_text TEXT DEFAULT '',
               linked_task_id TEXT DEFAULT '',
               linked_task_title_snapshot TEXT DEFAULT '',
               deployment_id TEXT DEFAULT '',
@@ -979,6 +1234,8 @@ def init_board():
             'playbook_id': "TEXT DEFAULT ''",
             'blocked_reason': "TEXT DEFAULT ''",
             'notes': "TEXT DEFAULT ''",
+            'result_text': "TEXT DEFAULT ''",
+            'last_note': "TEXT DEFAULT ''",
             'updated_at': "TEXT DEFAULT ''",
         }
         for column, ddl in task_column_defaults.items():
@@ -1026,6 +1283,12 @@ def init_board():
             'trigger_label': "TEXT DEFAULT ''",
             'changed_fields_json': "TEXT DEFAULT '[]'",
             'metadata_json': "TEXT DEFAULT '{}'",
+            'task_title_snapshot': "TEXT DEFAULT ''",
+            'assignee_id': "TEXT DEFAULT ''",
+            'assignee_name': "TEXT DEFAULT ''",
+            'playbook_id': "TEXT DEFAULT ''",
+            'playbook_name': "TEXT DEFAULT ''",
+            'result_text': "TEXT DEFAULT ''",
             'linked_task_id': "TEXT DEFAULT ''",
             'linked_task_title_snapshot': "TEXT DEFAULT ''",
             'deployment_id': "TEXT DEFAULT ''",
@@ -1044,13 +1307,21 @@ def init_board():
             f"UPDATE runs SET origin = 'seed' WHERE title IN ({','.join('?' for _ in RUN_SEED_TITLES)}) AND COALESCE(origin, 'live') = 'live'",
             tuple(RUN_SEED_TITLES),
         )
+        conn.execute("UPDATE runs SET task_title_snapshot = COALESCE(NULLIF(task_title_snapshot,''), linked_task_title_snapshot, '')")
+        conn.execute("UPDATE runs SET assignee_id = COALESCE(NULLIF(assignee_id,''), agent_id, '')")
+        conn.execute("UPDATE runs SET assignee_name = COALESCE(NULLIF(assignee_name,''), agent_name_snapshot, '')")
+        conn.execute("UPDATE runs SET result_text = COALESCE(NULLIF(result_text,''), result_summary, '')")
+        conn.execute("UPDATE runs SET status = 'completed' WHERE lower(COALESCE(status,'')) IN ('completed','complete')")
+        conn.execute("UPDATE runs SET status = 'cancelled' WHERE lower(COALESCE(status,'')) IN ('cancelled','canceled')")
         backfill_run_semantics(conn)
         conn.execute("UPDATE agents SET deployment_status = COALESCE(NULLIF(deployment_status,''), 'not_deployed')")
 
         if 'status' in task_columns:
 
             conn.execute("UPDATE tasks SET status = 'backlog' WHERE LOWER(COALESCE(status,'')) = 'pending'")
-            conn.execute("UPDATE tasks SET status = 'done' WHERE LOWER(COALESCE(status,'')) IN ('completed','done')")
+            conn.execute("UPDATE tasks SET status = 'completed' WHERE LOWER(COALESCE(status,'')) IN ('completed','done','complete')")
+            conn.execute("UPDATE tasks SET status = 'revision_requested' WHERE LOWER(COALESCE(status,'')) IN ('revision requested','revision-requested')")
+            conn.execute("UPDATE tasks SET status = 'in_progress' WHERE LOWER(COALESCE(status,'')) = 'in progress'")
         conn.execute("UPDATE tasks SET updated_at = COALESCE(NULLIF(updated_at,''), created_at, ?) WHERE COALESCE(NULLIF(updated_at,''), '') = ''", (utc_now(),))
 
         count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
@@ -1147,12 +1418,26 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['playbook_id'] = str(item.get('playbook_id') or '')
     item['blocked_reason'] = str(item.get('blocked_reason') or '')
     item['notes'] = str(item.get('notes') or '')
+    item['result_text'] = str(item.get('result_text') or '')
+    item['last_note'] = str(item.get('last_note') or '')
     item['assigned_agent_name'] = str(item.get('assigned_agent_name') or '')
     item['linked_playbook_name'] = str(item.get('linked_playbook_name') or '')
+    item['instruction'] = item['description']
+    item['assigneeId'] = item['agent_id']
+    item['assigneeName'] = item['assigned_agent_name']
+    item['playbookId'] = item['playbook_id']
+    item['playbookName'] = item['linked_playbook_name']
+    item['result'] = item['result_text']
+    item['lastNote'] = item['last_note']
+    item['createdAt'] = str(item.get('created_at') or '')
+    item['updatedAt'] = str(item.get('updated_at') or '')
     item['created_at'] = str(item.get('created_at') or '')
     item['updated_at'] = str(item.get('updated_at') or '')
     dependency_ids = task_dependency_ids(conn, item['id'])
     item['dependency_ids'] = dependency_ids
+    item['attachment_ids'] = []
+    item['attachments'] = task_attachments_for_task(conn, item['id'])
+    item['attachment_ids'] = [attachment['id'] for attachment in item['attachments'] if attachment.get('id')]
     item['dependencies'] = [
         {'id': dep_id, 'title': dep_title}
         for dep_id, dep_title in conn.execute(
@@ -1169,6 +1454,48 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     return item
 
 
+def task_history_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, task_id, event_type, message, note, metadata_json, created_at
+        FROM task_events
+        WHERE task_id = ?
+        ORDER BY created_at ASC, id ASC
+        """,
+        (task_id,),
+    ).fetchall()
+    history = []
+    for row in rows:
+        item = dict(row)
+        item['id'] = int(item.get('id') or 0)
+        item['task_id'] = str(item.get('task_id') or '')
+        item['event_type'] = str(item.get('event_type') or '')
+        item['message'] = str(item.get('message') or '')
+        item['note'] = str(item.get('note') or '')
+        item['created_at'] = str(item.get('created_at') or '')
+        item['metadata'] = parse_json_object(item.get('metadata_json'))
+        item['createdAt'] = item['created_at']
+        history.append(item)
+    return history
+
+
+def task_event_create(conn: sqlite3.Connection, task_id: str, event_type: str, message: str, note: str = '', metadata: dict | None = None, created_at: str | None = None):
+    conn.execute(
+        """
+        INSERT INTO task_events (task_id, event_type, message, note, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(task_id or '').strip(),
+            str(event_type or '').strip() or 'updated',
+            str(message or '').strip() or 'Task updated.',
+            str(note or '').strip(),
+            json.dumps(metadata or {}, ensure_ascii=False),
+            created_at or utc_now(),
+        ),
+    )
+
+
 TASK_SELECT = """
 SELECT
   t.*,
@@ -1180,17 +1507,26 @@ LEFT JOIN playbooks p ON p.id = t.playbook_id
 """
 
 
-def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: dict | None = None) -> tuple[dict, list[str]]:
+def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: dict | None = None) -> tuple[dict, list[str], list[str], str]:
     source = dict(existing or {})
     title = str(payload.get('title', source.get('title', '')) or '').strip()
     if not title:
         raise ValueError('title is required')
+    instruction = str(payload.get('instruction', payload.get('description', source.get('description', ''))) or '').strip()
+    if not instruction:
+        raise ValueError('instruction is required')
     task_id = source.get('id') or uuid.uuid4().hex
     status = normalize_task_status(payload.get('status', source.get('status', 'backlog')) or 'backlog')
     priority = normalize_task_priority(payload.get('priority', source.get('priority', 'medium')) or 'medium')
-    agent_id = str(payload.get('agent_id', source.get('agent_id', '')) or '').strip()
-    playbook_id = str(payload.get('playbook_id', source.get('playbook_id', '')) or '').strip()
+    agent_id = str(payload.get('agent_id', payload.get('assigneeId', source.get('agent_id', ''))) or '').strip()
+    playbook_id = str(payload.get('playbook_id', payload.get('playbookId', source.get('playbook_id', ''))) or '').strip()
+    result_text = str(payload.get('result_text', payload.get('result', source.get('result_text', ''))) or '').strip()
+    last_note = str(payload.get('last_note', payload.get('lastNote', source.get('last_note', ''))) or '').strip()
+    if status == 'ready' and not agent_id:
+        raise ValueError('Run Now requires assignee')
     dependency_ids = parse_task_dependency_ids(payload.get('dependency_ids', payload.get('dependencies', [])))
+    attachment_ids = parse_task_attachment_ids(payload.get('attachment_ids', payload.get('attachments', [])))
+    attachment_draft_token = str(payload.get('attachment_draft_token', payload.get('draft_token', '')) or '').strip()
     if task_id in dependency_ids:
         raise ValueError('dependency IDs must not include the task itself')
     if agent_id and not task_exists(conn, 'agents', agent_id):
@@ -1206,27 +1542,40 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
         missing = [dep_id for dep_id in dependency_ids if dep_id not in found]
         if missing:
             raise ValueError(f"unknown dependency task IDs: {', '.join(missing)}")
+    attachment_rows = task_attachment_rows_for_ids(conn, attachment_ids)
+    for row in attachment_rows:
+        owner_task_id = str(row.get('task_id') or '').strip()
+        owner_draft_token = str(row.get('draft_token') or '').strip()
+        if owner_task_id and owner_task_id != task_id:
+            raise ValueError(f"attachment belongs to another task: {row.get('filename') or row.get('id')}")
+        if not owner_task_id:
+            if not attachment_draft_token:
+                raise ValueError('attachment_draft_token is required for staged attachments')
+            if owner_draft_token != attachment_draft_token:
+                raise ValueError(f"attachment draft token mismatch: {row.get('filename') or row.get('id')}")
     now = utc_now()
     item = {
         'id': task_id,
         'title': title,
-        'description': str(payload.get('description', source.get('description', '')) or '').strip(),
+        'description': instruction,
         'status': status,
         'priority': priority,
         'agent_id': agent_id,
         'playbook_id': playbook_id,
         'blocked_reason': str(payload.get('blocked_reason', source.get('blocked_reason', '')) or '').strip(),
         'notes': str(payload.get('notes', source.get('notes', '')) or '').strip(),
+        'result_text': result_text,
+        'last_note': last_note,
         'created_at': source.get('created_at') or now,
         'updated_at': now,
     }
-    return item, dependency_ids
+    return item, dependency_ids, attachment_ids, attachment_draft_token
 
 
 def task_list() -> list[dict]:
     with connect_board() as conn:
         rows = conn.execute(
-            TASK_SELECT + " ORDER BY CASE t.status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'ready' THEN 2 WHEN 'backlog' THEN 3 ELSE 4 END, CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, t.updated_at DESC, t.created_at DESC"
+            TASK_SELECT + " ORDER BY CASE t.status WHEN 'ready' THEN 0 WHEN 'triage' THEN 1 WHEN 'backlog' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'review' THEN 4 WHEN 'revision_requested' THEN 5 WHEN 'blocked' THEN 6 WHEN 'completed' THEN 7 ELSE 8 END, CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, t.updated_at DESC, t.created_at DESC"
         ).fetchall()
         return [normalize_task_row(row, conn) for row in rows]
 
@@ -1238,7 +1587,31 @@ def task_get(task_id: str):
         row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
         if row is None:
             raise KeyError('task not found')
-        return {'task': normalize_task_row(row, conn)}
+        task = normalize_task_row(row, conn)
+        runs = task_runs_list(conn, task_id)
+        latest_run = runs[0] if runs else None
+        task['runs'] = runs
+        task['latest_run'] = latest_run
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run}
+
+
+def task_history_get(task_id: str):
+    if not task_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        if conn.execute('SELECT id FROM tasks WHERE id = ?', (task_id,)).fetchone() is None:
+            raise KeyError('task not found')
+        return {'history': task_history_list(conn, task_id)}
+
+
+def task_runs_get(task_id: str):
+    if not task_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        if conn.execute('SELECT id FROM tasks WHERE id = ?', (task_id,)).fetchone() is None:
+            raise KeyError('task not found')
+        runs = task_runs_list(conn, task_id)
+        return {'runs': runs, 'latest_run': runs[0] if runs else None}
 
 
 def sync_task_dependencies(conn: sqlite3.Connection, task_id: str, dependency_ids: list[str]):
@@ -1270,20 +1643,22 @@ def task_create(payload: dict):
         )
         mark_run_running(conn, run["id"], summary="Creating task record.", run_detail="Validated task payload. Writing board row and dependency links.", result_label="Running", trigger_label="Manual board action", log_preview="Validated task payload. Writing to board.db.")
         try:
-            task, dependency_ids = task_record_from_payload(payload, conn)
+            task, dependency_ids, attachment_ids, attachment_draft_token = task_record_from_payload(payload, conn)
             conn.execute(
                 """
                 INSERT INTO tasks (
-                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, created_at, updated_at
+                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, result_text, last_note, created_at, updated_at
                 ) VALUES (
-                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :created_at, :updated_at
+                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :result_text, :last_note, :created_at, :updated_at
                 )
                 """,
                 task,
             )
             sync_task_dependencies(conn, task['id'], dependency_ids)
+            sync_task_attachments(conn, task['id'], attachment_ids, attachment_draft_token)
             row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task['id'],)).fetchone()
             record = normalize_task_row(row, conn)
+            task_event_create(conn, record['id'], 'created', f"Task created in {str(record['status']).replace('_', ' ').title()}.", note=record.get('last_note', ''), metadata={'status': record.get('status',''), 'agent_id': record.get('agent_id',''), 'playbook_id': record.get('playbook_id',''), 'result_text': record.get('result_text','')}, created_at=record.get('created_at') or utc_now())
             final_ctx = run_context_for_task(conn, task_id=record['id'], task=record)
             status_label = str(record['status']).replace('_', ' ').title()
             complete_run_record(
@@ -1291,12 +1666,12 @@ def task_create(payload: dict):
                 run["id"],
                 "success",
                 summary=f"Task \"{record['title']}\" created in {status_label}.",
-                run_detail=f"Priority set to {record['priority']}. {len(record.get('dependency_ids') or [])} dependency link(s) saved.",
+                run_detail=f"Priority set to {record['priority']}. {len(record.get('dependency_ids') or [])} dependency link(s) and {len(record.get('attachment_ids') or [])} attachment(s) saved.",
                 result_label="Created",
-                log_preview=f"Created {record['title']} · priority {record['priority']} · dependencies {len(record.get('dependency_ids') or [])}.",
+                log_preview=f"Created {record['title']} · priority {record['priority']} · dependencies {len(record.get('dependency_ids') or [])} · attachments {len(record.get('attachment_ids') or [])}.",
                 trigger_label="Manual board action",
-                changed_fields=["Title", "Status", "Priority", "Dependencies"],
-                metadata={**run_context_metadata(task_id=record['id'], task_title=record['title'], agent_id=record.get('agent_id',''), deployment_id=final_ctx.get('deployment_id',''), deployment_target=final_ctx.get('deployment_target_snapshot',''), deployment_type=final_ctx.get('deployment_type_snapshot','')), "priority": record['priority'], "status": status_label, "dependency_count": len(record.get('dependency_ids') or [])},
+                changed_fields=["Title", "Status", "Priority", "Dependencies", "Attachments"],
+                metadata={**run_context_metadata(task_id=record['id'], task_title=record['title'], agent_id=record.get('agent_id',''), deployment_id=final_ctx.get('deployment_id',''), deployment_target=final_ctx.get('deployment_target_snapshot',''), deployment_type=final_ctx.get('deployment_type_snapshot','')), "priority": record['priority'], "status": status_label, "dependency_count": len(record.get('dependency_ids') or []), "attachment_count": len(record.get('attachment_ids') or [])},
                 title=trim_run_text(f"Create task: {record['title']}", 140),
                 **final_ctx,
             )
@@ -1328,6 +1703,7 @@ def task_update(task_id: str, payload: dict):
         if existing is None:
             raise KeyError('task not found')
         existing_row = dict(existing)
+        existing_record = normalize_task_row(existing, conn)
         base_title = trim_run_text(f"Update task: {existing_row.get('title') or 'Untitled task'}", 140)
         initial_ctx = run_context_for_task(conn, task_id=task_id, task=existing_row)
         run = create_run_record(
@@ -1346,7 +1722,7 @@ def task_update(task_id: str, payload: dict):
         )
         mark_run_running(conn, run["id"], summary="Applying task changes.", run_detail="Writing task fields and dependency links.", result_label="Running", trigger_label="Manual board action", log_preview="Current task loaded. Writing updated fields.")
         try:
-            task, dependency_ids = task_record_from_payload(payload, conn, existing_row)
+            task, dependency_ids, attachment_ids, attachment_draft_token = task_record_from_payload(payload, conn, existing_row)
             conn.execute(
                 """
                 UPDATE tasks
@@ -1358,19 +1734,42 @@ def task_update(task_id: str, payload: dict):
                     playbook_id = :playbook_id,
                     blocked_reason = :blocked_reason,
                     notes = :notes,
+                    result_text = :result_text,
+                    last_note = :last_note,
                     updated_at = :updated_at
                 WHERE id = :id
                 """,
                 task,
             )
             sync_task_dependencies(conn, task_id, dependency_ids)
+            sync_task_attachments(conn, task_id, attachment_ids, attachment_draft_token)
             row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
             record = normalize_task_row(row, conn)
+            previous_status = str(existing_record.get('status') or '')
+            current_status = str(record.get('status') or '')
+            if previous_status != current_status:
+                task_event_create(conn, record['id'], 'status_changed', f"Status changed from {previous_status.replace('_', ' ').title() or 'Unknown'} to {current_status.replace('_', ' ').title()}.", note=record.get('last_note', ''), metadata={'from_status': previous_status, 'to_status': current_status})
+            if str(existing_record.get('agent_id') or '') != str(record.get('agent_id') or ''):
+                before_name = existing_record.get('assigned_agent_name') or 'Unassigned'
+                after_name = record.get('assigned_agent_name') or 'Unassigned'
+                task_event_create(conn, record['id'], 'assignee_changed', f"Assignee changed from {before_name} to {after_name}.", metadata={'from_agent_id': existing_record.get('agent_id',''), 'to_agent_id': record.get('agent_id','')})
+            if str(existing_record.get('playbook_id') or '') != str(record.get('playbook_id') or ''):
+                before_name = existing_record.get('linked_playbook_name') or 'No playbook'
+                after_name = record.get('linked_playbook_name') or 'No playbook'
+                task_event_create(conn, record['id'], 'playbook_changed', f"Playbook changed from {before_name} to {after_name}.", metadata={'from_playbook_id': existing_record.get('playbook_id',''), 'to_playbook_id': record.get('playbook_id','')})
+            if str(existing_record.get('description') or '') != str(record.get('description') or ''):
+                task_event_create(conn, record['id'], 'instruction_updated', 'Instruction updated.', metadata={'previous_length': len(str(existing_record.get('description') or '')), 'current_length': len(str(record.get('description') or ''))})
+            if str(existing_record.get('result_text') or '') != str(record.get('result_text') or ''):
+                task_event_create(conn, record['id'], 'result_saved', 'Result/output updated.', note=record.get('result_text', ''), metadata={'has_result': bool(str(record.get('result_text') or '').strip())})
+            if record.get('last_note') and str(existing_record.get('last_note') or '') != str(record.get('last_note') or '') and previous_status == current_status:
+                task_event_create(conn, record['id'], 'note_saved', 'Operator note updated.', note=record.get('last_note', ''))
             final_ctx = run_context_for_task(conn, task_id=record['id'], task=record)
             status_label = str(record['status']).replace('_', ' ').title()
             changed_fields = run_changed_fields_for_keys(existing_row, record, [('title', 'Title'), ('status', 'Status'), ('priority', 'Priority'), ('agent_id', 'Assigned Agent'), ('playbook_id', 'Playbook'), ('blocked_reason', 'Blocked Reason'), ('notes', 'Notes'), ('description', 'Description')])
             if sorted(existing_row.get('dependency_ids') or []) != sorted(record.get('dependency_ids') or []):
                 changed_fields.append('Dependencies')
+            if sorted((existing_row.get('attachment_ids') or [])) != sorted(record.get('attachment_ids') or []):
+                changed_fields.append('Attachments')
             summary = f"Task \"{record['title']}\" updated."
             previous_status_label = str(existing_row.get('status') or '').replace('_', ' ').title()
             if previous_status_label and previous_status_label != status_label:
@@ -1380,12 +1779,12 @@ def task_update(task_id: str, payload: dict):
                 run["id"],
                 "success",
                 summary=summary,
-                run_detail=f"Changed {', '.join(changed_fields) if changed_fields else 'task metadata'}; task now has priority {record['priority']} and {len(record.get('dependency_ids') or [])} dependency link(s).",
+                run_detail=f"Changed {', '.join(changed_fields) if changed_fields else 'task metadata'}; task now has priority {record['priority']}, {len(record.get('dependency_ids') or [])} dependency link(s), and {len(record.get('attachment_ids') or [])} attachment(s).",
                 result_label="Updated",
-                log_preview=f"Saved {record['title']} · priority {record['priority']} · dependencies {len(record.get('dependency_ids') or [])}.",
+                log_preview=f"Saved {record['title']} · priority {record['priority']} · dependencies {len(record.get('dependency_ids') or [])} · attachments {len(record.get('attachment_ids') or [])}.",
                 trigger_label="Manual board action",
                 changed_fields=changed_fields,
-                metadata={**run_context_metadata(task_id=record['id'], task_title=record['title'], agent_id=record.get('agent_id',''), deployment_id=final_ctx.get('deployment_id',''), deployment_target=final_ctx.get('deployment_target_snapshot',''), deployment_type=final_ctx.get('deployment_type_snapshot','')), 'status': status_label, 'priority': record['priority'], 'dependency_count': len(record.get('dependency_ids') or [])},
+                metadata={**run_context_metadata(task_id=record['id'], task_title=record['title'], agent_id=record.get('agent_id',''), deployment_id=final_ctx.get('deployment_id',''), deployment_target=final_ctx.get('deployment_target_snapshot',''), deployment_type=final_ctx.get('deployment_type_snapshot','')), 'status': status_label, 'priority': record['priority'], 'dependency_count': len(record.get('dependency_ids') or []), 'attachment_count': len(record.get('attachment_ids') or [])},
                 title=trim_run_text(f"Update task: {record['title']}", 140),
                 **final_ctx,
             )
@@ -1433,22 +1832,26 @@ def task_delete(task_id: str):
             run_purpose="task_lifecycle",
             **initial_ctx,
         )
-        mark_run_running(conn, run["id"], summary="Deleting task record.", run_detail="Removing task row and attached dependency links.", result_label="Running", trigger_label="Manual board action", log_preview="Removing task and dependency links.")
+        mark_run_running(conn, run["id"], summary="Deleting task record.", run_detail="Removing task row, dependency links, and task attachments.", result_label="Running", trigger_label="Manual board action", log_preview="Removing task, dependency links, and attachments.")
         try:
             dependency_links = conn.execute('SELECT COUNT(*) FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?', (task_id, task_id)).fetchone()[0]
+            attachment_rows = conn.execute('SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC', (task_id,)).fetchall()
+            attachment_count = len(attachment_rows)
+            delete_task_attachment_rows(conn, attachment_rows)
             conn.execute('DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?', (task_id, task_id))
+            conn.execute('DELETE FROM task_events WHERE task_id = ?', (task_id,))
             cur = conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
             complete_run_record(
                 conn,
                 run["id"],
                 "success",
                 summary=f"Task \"{existing_row.get('title') or 'Untitled task'}\" removed from the board.",
-                run_detail=f"Deleted the task row and detached {dependency_links} related dependency link(s).",
+                run_detail=f"Deleted the task row, detached {dependency_links} related dependency link(s), and removed {attachment_count} attachment(s).",
                 result_label="Deleted",
-                log_preview=f"Deleted {existing_row.get('title') or 'Untitled task'} and detached dependency links.",
+                log_preview=f"Deleted {existing_row.get('title') or 'Untitled task'} · detached dependency links · removed {attachment_count} attachment(s).",
                 trigger_label="Manual board action",
-                changed_fields=['Deleted', 'Dependencies'],
-                metadata={**run_context_metadata(task_id=task_id, task_title=existing_row.get('title',''), agent_id=existing_row.get('agent_id',''), deployment_id=initial_ctx.get('deployment_id',''), deployment_target=initial_ctx.get('deployment_target_snapshot',''), deployment_type=initial_ctx.get('deployment_type_snapshot','')), 'dependency_links_removed': dependency_links},
+                changed_fields=['Deleted', 'Dependencies', 'Attachments'],
+                metadata={**run_context_metadata(task_id=task_id, task_title=existing_row.get('title',''), agent_id=existing_row.get('agent_id',''), deployment_id=initial_ctx.get('deployment_id',''), deployment_target=initial_ctx.get('deployment_target_snapshot',''), deployment_type=initial_ctx.get('deployment_type_snapshot','')), 'dependency_links_removed': dependency_links, 'attachment_count_removed': attachment_count},
                 title=base_title,
                 **initial_ctx,
             )
@@ -2358,10 +2761,16 @@ def normalize_run_type(value) -> str:
 
 
 def normalize_run_status(value) -> str:
-    clean = str(value or "queued").strip().lower()
+    raw = str(value or "queued").strip().lower()
+    clean = RUN_STATUS_ALIASES.get(raw, raw)
     if clean not in RUN_STATUSES:
         raise ValueError(f"status must be one of: {', '.join(RUN_STATUSES)}")
     return clean
+
+
+def display_run_status(value) -> str:
+    status = normalize_run_status(value)
+    return 'completed' if status == 'success' else status
 
 
 def normalize_run_origin(value) -> str:
@@ -2373,11 +2782,17 @@ def normalize_run_origin(value) -> str:
 
 def normalize_run_source(value) -> str:
     clean = str(value or "").strip().lower()
+    if not clean:
+        return ""
+    clean = RUN_SOURCE_ALIASES.get(clean, clean)
     return clean if clean in RUN_SOURCES else ""
 
 
 def normalize_run_purpose(value) -> str:
     clean = str(value or "").strip().lower()
+    if not clean:
+        return ""
+    clean = RUN_PURPOSE_ALIASES.get(clean, clean)
     return clean if clean in RUN_PURPOSES else ""
 
 
@@ -2400,36 +2815,42 @@ def run_semantics_from_row(row) -> tuple[str, str]:
     ]).lower()
     origin = normalize_run_origin(item.get('origin') or 'live')
     if origin == 'seed' or title in RUN_SEED_TITLES:
-        return source or 'demo', purpose or 'demo_seed'
+        return source or 'system', purpose or 'test'
     if any(re.search(pattern, hay) for pattern in RUN_TEST_PATTERNS):
         return source or 'verification', purpose or 'smoke_test'
     if title_lower.startswith(('create task:', 'update task:', 'delete task:')):
-        return source or 'user', purpose or 'task_lifecycle'
+        return source or 'user', purpose or 'diagnostic'
     if title_lower.startswith(('create deployment:', 'update deployment:', 'delete deployment:')):
-        return source or 'user', purpose or 'deployment_lifecycle'
+        return source or 'deployment', purpose or 'diagnostic'
     if title_lower.startswith(('create agent:', 'update agent:', 'delete agent:')):
-        return source or 'user', purpose or 'agent_lifecycle'
+        return source or 'user', purpose or 'diagnostic'
+    if str(item.get('linked_task_id') or '').strip():
+        return source or 'task', purpose or 'execution'
+    if str(item.get('deployment_id') or '').strip():
+        return source or 'deployment', purpose or 'execution'
     if normalize_run_type(item.get('type') or 'task_run') == 'evaluation':
-        return source or 'system', purpose or 'evaluation'
-    return source, purpose
+        return source or 'runtime', purpose or 'execution'
+    if normalize_run_type(item.get('type') or 'task_run') == 'agent_execution':
+        return source or 'runtime', purpose or 'execution'
+    return source or 'unknown', purpose or 'unknown'
 
 
 RUN_SOURCE_PRESENTATION = {
     'user': {
-        'source_label': 'Operator Action',
-        'source_badge': 'Operator',
-        'kind_label': 'Operator Activity',
-        'kind_badge': 'Operator',
+        'source_label': 'User',
+        'source_badge': 'User',
+        'kind_label': 'User Activity',
+        'kind_badge': 'User',
         'semantic_tone': 'user',
         'importance_level': 'normal',
     },
-    'demo': {
-        'source_label': 'Demo Data',
-        'source_badge': 'Demo',
-        'kind_label': 'Demo / Seed Activity',
-        'kind_badge': 'Demo',
-        'semantic_tone': 'demo',
-        'importance_level': 'low',
+    'system': {
+        'source_label': 'System',
+        'source_badge': 'System',
+        'kind_label': 'System Activity',
+        'kind_badge': 'System',
+        'semantic_tone': 'system',
+        'importance_level': 'normal',
     },
     'verification': {
         'source_label': 'Verification',
@@ -2442,49 +2863,69 @@ RUN_SOURCE_PRESENTATION = {
     'runtime': {
         'source_label': 'Runtime',
         'source_badge': 'Runtime',
-        'kind_label': 'Execution Activity',
-        'kind_badge': 'Exec',
+        'kind_label': 'Runtime Activity',
+        'kind_badge': 'Runtime',
         'semantic_tone': 'runtime',
         'importance_level': 'medium',
     },
-    'system': {
-        'source_label': 'System',
-        'source_badge': 'System',
-        'kind_label': 'System Activity',
-        'kind_badge': 'System',
+    'deployment': {
+        'source_label': 'Deployment',
+        'source_badge': 'Deploy',
+        'kind_label': 'Deployment Activity',
+        'kind_badge': 'Deploy',
+        'semantic_tone': 'deployment',
+        'importance_level': 'normal',
+    },
+    'task': {
+        'source_label': 'Task',
+        'source_badge': 'Task',
+        'kind_label': 'Task Activity',
+        'kind_badge': 'Task',
+        'semantic_tone': 'task',
+        'importance_level': 'medium',
+    },
+    'unknown': {
+        'source_label': 'Unknown',
+        'source_badge': 'Unknown',
+        'kind_label': 'Operational Activity',
+        'kind_badge': 'Ops',
         'semantic_tone': 'system',
         'importance_level': 'normal',
     },
 }
 
 RUN_PURPOSE_PRESENTATION = {
-    'task_lifecycle': {
-        'purpose_label': 'Task Lifecycle',
-        'purpose_badge': 'Task',
-    },
-    'deployment_lifecycle': {
-        'purpose_label': 'Deployment Lifecycle',
-        'purpose_badge': 'Deploy',
-    },
-    'agent_lifecycle': {
-        'purpose_label': 'Agent Lifecycle',
-        'purpose_badge': 'Agent',
-    },
-    'demo_seed': {
-        'purpose_label': 'Demo Seed',
-        'purpose_badge': 'Seed',
-    },
-    'smoke_test': {
-        'purpose_label': 'Verification',
-        'purpose_badge': 'Verify',
-    },
-    'agent_execution': {
+    'execution': {
         'purpose_label': 'Execution',
         'purpose_badge': 'Exec',
     },
-    'evaluation': {
-        'purpose_label': 'Evaluation',
-        'purpose_badge': 'Eval',
+    'test': {
+        'purpose_label': 'Test',
+        'purpose_badge': 'Test',
+    },
+    'smoke_test': {
+        'purpose_label': 'Smoke Test',
+        'purpose_badge': 'Smoke',
+    },
+    'cleanup': {
+        'purpose_label': 'Cleanup',
+        'purpose_badge': 'Cleanup',
+    },
+    'verification': {
+        'purpose_label': 'Verification',
+        'purpose_badge': 'Verify',
+    },
+    'retry': {
+        'purpose_label': 'Retry',
+        'purpose_badge': 'Retry',
+    },
+    'diagnostic': {
+        'purpose_label': 'Diagnostic',
+        'purpose_badge': 'Diag',
+    },
+    'unknown': {
+        'purpose_label': 'Unknown',
+        'purpose_badge': 'Unknown',
     },
 }
 
@@ -2498,14 +2939,14 @@ def readable_run_semantic_label(value: str) -> str:
 
 def derive_run_importance_level(row: dict | None, source: str, purpose: str) -> str:
     item = dict(row or {})
-    status = str(item.get('status') or '').strip().lower()
+    status = display_run_status(item.get('status') or '')
     if status == 'failed':
         return 'high'
-    if source == 'demo' or purpose == 'demo_seed':
+    if source == 'system' and purpose == 'test':
         return 'low'
-    if source == 'verification' or purpose == 'smoke_test':
+    if source == 'verification' or purpose in {'smoke_test', 'verification', 'test'}:
         return 'low'
-    if source == 'runtime' or purpose in {'agent_execution', 'evaluation'}:
+    if source in {'runtime', 'task'} or purpose == 'execution':
         return 'medium'
     return 'normal'
 
@@ -2521,11 +2962,11 @@ def build_run_semantic_presentation(row: dict | None, *, raw_source: str = '', r
     purpose_label = purpose_meta.get('purpose_label') or readable_run_semantic_label(purpose or raw_purpose_value) or 'General Activity'
     tone = source_meta.get('semantic_tone') or 'system'
     importance_level = derive_run_importance_level(item, source, purpose)
-    status = str(item.get('status') or '').strip().lower()
+    status = display_run_status(item.get('status') or '')
     if status == 'failed':
         tone = 'failure'
-    kind_label = source_meta.get('kind_label') or ('Execution Activity' if purpose in {'agent_execution', 'evaluation'} else 'Operational Activity')
-    kind_badge = source_meta.get('kind_badge') or ('Exec' if purpose in {'agent_execution', 'evaluation'} else 'Ops')
+    kind_label = source_meta.get('kind_label') or ('Execution Activity' if purpose == 'execution' else 'Operational Activity')
+    kind_badge = source_meta.get('kind_badge') or ('Exec' if purpose == 'execution' else 'Ops')
     return {
         'source_label': source_label,
         'source_badge': source_meta.get('source_badge') or readable_run_semantic_label(source or raw_source_value) or 'Unknown',
@@ -2541,16 +2982,20 @@ def build_run_semantic_presentation(row: dict | None, *, raw_source: str = '', r
 
 def is_demo_run_row(row) -> bool:
     source, purpose = run_semantics_from_row(row)
-    if source == 'demo' or purpose == 'demo_seed':
+    if source == 'system' or purpose == 'test':
         return True
     return normalize_run_origin(dict(row or {}).get('origin') or 'live') == 'seed'
 
 
 def is_verification_run_row(row) -> bool:
-    source, purpose = run_semantics_from_row(row)
-    if source == 'verification' or purpose == 'smoke_test':
-        return True
     item = dict(row or {})
+    explicit_source = normalize_run_source(item.get('run_source'))
+    explicit_purpose = normalize_run_purpose(item.get('run_purpose'))
+    if explicit_source or explicit_purpose:
+        return explicit_source == 'verification' or explicit_purpose in {'smoke_test', 'verification'}
+    source, purpose = run_semantics_from_row(item)
+    if source == 'verification' or purpose in {'smoke_test', 'verification'}:
+        return True
     if normalize_run_origin(item.get('origin') or 'live') != 'live':
         return False
     hay = ' '.join([
@@ -2911,13 +3356,15 @@ def run_changed_fields_for_keys(before: dict | None, after: dict | None, mapping
 RUN_SELECT = """
 SELECT
   r.*,
-  COALESCE(a.name, NULLIF(r.agent_name_snapshot, ''), '') AS agent_name,
-  COALESCE(t.title, NULLIF(r.linked_task_title_snapshot, ''), '') AS linked_task_title,
+  COALESCE(a.name, NULLIF(r.assignee_name, ''), NULLIF(r.agent_name_snapshot, ''), '') AS agent_name,
+  COALESCE(t.title, NULLIF(r.task_title_snapshot, ''), NULLIF(r.linked_task_title_snapshot, ''), '') AS linked_task_title,
+  COALESCE(p.name, NULLIF(r.playbook_name, ''), '') AS linked_playbook_name,
   COALESCE(d.target, NULLIF(r.deployment_target_snapshot, ''), '') AS deployment_target,
   COALESCE(d.deployment_type, NULLIF(r.deployment_type_snapshot, ''), '') AS deployment_type
 FROM runs r
-LEFT JOIN agents a ON a.id = r.agent_id
+LEFT JOIN agents a ON a.id = COALESCE(NULLIF(r.assignee_id, ''), NULLIF(r.agent_id, ''))
 LEFT JOIN tasks t ON t.id = r.linked_task_id
+LEFT JOIN playbooks p ON p.id = r.playbook_id
 LEFT JOIN deployments d ON d.id = r.deployment_id
 """
 
@@ -2936,6 +3383,7 @@ def normalize_run_row(row) -> dict | None:
     item['target'] = str(item.get('target') or '')
     item['environment'] = str(item.get('environment') or '')
     item['status'] = normalize_run_status(item.get('status') or 'queued')
+    item['display_status'] = display_run_status(item['status'])
     item['started_at'] = str(item.get('started_at') or '')
     item['finished_at'] = str(item.get('finished_at') or '')
     item['summary'] = str(item.get('summary') or '')
@@ -2957,6 +3405,13 @@ def normalize_run_row(row) -> dict | None:
     item['trigger_label'] = str(item.get('trigger_label') or '')
     item['changed_fields'] = sanitize_changed_fields(item.get('changed_fields_json'))
     item['metadata'] = sanitize_run_metadata(item.get('metadata_json'))
+    item['task_id'] = str(item.get('linked_task_id') or '')
+    item['task_title_snapshot'] = str(item.get('task_title_snapshot') or item.get('linked_task_title') or item.get('linked_task_title_snapshot') or '')
+    item['assignee_id'] = str(item.get('assignee_id') or item.get('agent_id') or '')
+    item['assignee_name'] = str(item.get('agent_name') or item.get('assignee_name') or item.get('agent_name_snapshot') or '')
+    item['playbook_id'] = str(item.get('playbook_id') or '')
+    item['playbook_name'] = str(item.get('linked_playbook_name') or item.get('playbook_name') or '')
+    item['result_text'] = str(item.get('result_text') or item.get('result_summary') or '')
     item['linked_task_id'] = str(item.get('linked_task_id') or '')
     item['linked_task_title'] = str(item.get('linked_task_title') or '')
     item['deployment_id'] = str(item.get('deployment_id') or '')
@@ -2979,6 +3434,7 @@ def normalize_run_row(row) -> dict | None:
     }
     item['result'] = {
         'summary': item['result_summary'],
+        'text': item['result_text'],
         'payload': item['result_payload'],
         'status': item['output_status'],
     }
@@ -2988,59 +3444,82 @@ def normalize_run_row(row) -> dict | None:
     return item
 
 
+def normalize_context_entity_type(value) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    lowered = raw.lower()
+    if lowered == 'task':
+        return 'Task'
+    if lowered == 'deployment':
+        return 'Deployment'
+    if lowered == 'agent':
+        return 'Agent'
+    return raw
+
+
 def resolve_run_entity_ref(item: dict | None) -> dict:
     row = dict(item or {})
-    entity_type = str(row.get('target_entity_type') or '').strip()
+    entity_type = normalize_context_entity_type(row.get('target_entity_type'))
     entity_id = str(row.get('target_entity_id') or '').strip()
     entity_name = str(row.get('target_entity_name') or '').strip()
-    if entity_type and entity_id:
-        return {'entity_type': entity_type, 'entity_id': entity_id, 'entity_name': entity_name}
     linked_task_id = str(row.get('linked_task_id') or '').strip()
     deployment_id = str(row.get('deployment_id') or '').strip()
     agent_id = str(row.get('agent_id') or '').strip()
-    if entity_type == 'Task':
-        if linked_task_id:
-            return {
-                'entity_type': 'Task',
-                'entity_id': linked_task_id,
-                'entity_name': entity_name or str(row.get('linked_task_title') or '').strip(),
-            }
-        return {'entity_type': '', 'entity_id': '', 'entity_name': entity_name}
-    if entity_type == 'Deployment':
-        if deployment_id:
-            return {
-                'entity_type': 'Deployment',
-                'entity_id': deployment_id,
-                'entity_name': entity_name or str(row.get('deployment_target') or '').strip(),
-            }
-        return {'entity_type': '', 'entity_id': '', 'entity_name': entity_name}
-    if entity_type == 'Agent':
-        if agent_id:
-            return {
-                'entity_type': 'Agent',
-                'entity_id': agent_id,
-                'entity_name': entity_name or str(row.get('agent_name') or '').strip(),
-            }
-        return {'entity_type': '', 'entity_id': '', 'entity_name': entity_name}
+    if entity_type:
+        if entity_id:
+            return {'entity_type': entity_type, 'entity_id': entity_id, 'entity_name': entity_name, 'guarded_empty': False}
+        return {'entity_type': entity_type, 'entity_id': '', 'entity_name': entity_name, 'guarded_empty': True}
     if linked_task_id:
         return {
             'entity_type': 'Task',
             'entity_id': linked_task_id,
-            'entity_name': entity_name or str(row.get('linked_task_title') or '').strip(),
+            'entity_name': entity_name or str(row.get('linked_task_title') or row.get('task_title_snapshot') or '').strip(),
+            'guarded_empty': False,
         }
     if deployment_id:
         return {
             'entity_type': 'Deployment',
             'entity_id': deployment_id,
             'entity_name': entity_name or str(row.get('deployment_target') or '').strip(),
+            'guarded_empty': False,
         }
     if agent_id:
         return {
             'entity_type': 'Agent',
             'entity_id': agent_id,
-            'entity_name': entity_name or str(row.get('agent_name') or '').strip(),
+            'entity_name': entity_name or str(row.get('agent_name') or row.get('assignee_name') or '').strip(),
+            'guarded_empty': False,
         }
-    return {'entity_type': '', 'entity_id': '', 'entity_name': entity_name}
+    return {'entity_type': '', 'entity_id': '', 'entity_name': entity_name, 'guarded_empty': False}
+
+
+def compact_run_context_item(item: dict | None) -> dict | None:
+    row = normalize_run_row(item) if item else None
+    if row is None:
+        return None
+    semantic = row.get('semantic_display') or {}
+    return {
+        'id': str(row.get('id') or ''),
+        'title': str(row.get('task_title_snapshot') or row.get('title') or 'Untitled run'),
+        'status': str(row.get('display_status') or row.get('status') or ''),
+        'created_at': str(row.get('created_at') or ''),
+        'started_at': str(row.get('started_at') or ''),
+        'finished_at': str(row.get('finished_at') or ''),
+        'updated_at': str(row.get('updated_at') or ''),
+        'run_source': str(row.get('run_source') or ''),
+        'run_purpose': str(row.get('run_purpose') or ''),
+        'semantic_display': semantic,
+        'task_id': str(row.get('task_id') or row.get('linked_task_id') or ''),
+        'task_title_snapshot': str(row.get('task_title_snapshot') or ''),
+        'assignee_name': str(row.get('assignee_name') or ''),
+        'target_entity_type': str(row.get('target_entity_type') or ''),
+        'target_entity_id': str(row.get('target_entity_id') or ''),
+        'target_entity_name': str(row.get('target_entity_name') or ''),
+        'summary': str(row.get('summary') or ''),
+        'result_text': str(row.get('result_text') or ''),
+        'log_preview': str(row.get('log_preview') or ''),
+    }
 
 
 def fetch_related_runs_for_entity(conn: sqlite3.Connection, entity_type: str, entity_id: str) -> list[dict]:
@@ -3097,21 +3576,48 @@ def build_run_context_payload(conn: sqlite3.Connection, run_id: str, *, max_rece
     entity_ref = resolve_run_entity_ref(run)
     entity_type = entity_ref.get('entity_type') or ''
     entity_id = entity_ref.get('entity_id') or ''
-    related_runs = fetch_related_runs_for_entity(conn, entity_type, entity_id) if entity_type and entity_id else []
-    anchor_index = next((idx for idx, item in enumerate(related_runs) if str(item.get('id') or '') == str(run.get('id') or '')), -1)
-    preceding = related_runs[anchor_index - 1] if anchor_index > 0 else None
-    following = related_runs[anchor_index + 1] if anchor_index >= 0 and anchor_index + 1 < len(related_runs) else None
-    same_entity_recent, hidden_count = select_same_entity_recent_runs(related_runs, anchor_index, max_recent=max_recent)
-    same_entity_recent_total = len(same_entity_recent) + hidden_count
+    guarded_empty = bool(entity_ref.get('guarded_empty'))
+    if guarded_empty:
+        related_runs = []
+        anchor_index = -1
+    else:
+        related_runs = fetch_related_runs_for_entity(conn, entity_type, entity_id) if entity_type and entity_id else []
+        anchor_index = next((idx for idx, item in enumerate(related_runs) if str(item.get('id') or '') == str(run.get('id') or '')), -1)
+    before = related_runs[anchor_index - 1] if anchor_index > 0 else None
+    after = related_runs[anchor_index + 1] if anchor_index >= 0 and anchor_index + 1 < len(related_runs) else None
+    recent, hidden_count = select_same_entity_recent_runs(related_runs, anchor_index, max_recent=max_recent)
+    recent_total = len(recent) + hidden_count
+    compact_before = compact_run_context_item(before)
+    compact_after = compact_run_context_item(after)
+    compact_recent = [item for item in (compact_run_context_item(item) for item in recent) if item]
     return {
+        'run_id': str(run.get('id') or run_id),
+        'entity': {
+            'entity_type': entity_type,
+            'entity_id': entity_id,
+            'entity_name': str(entity_ref.get('entity_name') or ''),
+            'guarded_empty': guarded_empty,
+        },
+        'before': compact_before,
+        'after': compact_after,
+        'recent': compact_recent,
+        'recent_total': recent_total,
+        'recent_shown': len(compact_recent),
+        'recent_hidden': hidden_count,
+        'empty': not compact_before and not compact_after and not compact_recent,
         'run': run,
         'related': {
-            'entity': entity_ref,
-            'preceding': preceding,
-            'following': following,
-            'same_entity_recent': same_entity_recent,
-            'same_entity_recent_total': same_entity_recent_total,
-            'same_entity_recent_shown': len(same_entity_recent),
+            'entity': {
+                'entity_type': entity_type,
+                'entity_id': entity_id,
+                'entity_name': str(entity_ref.get('entity_name') or ''),
+                'guarded_empty': guarded_empty,
+            },
+            'preceding': compact_before,
+            'following': compact_after,
+            'same_entity_recent': compact_recent,
+            'same_entity_recent_total': recent_total,
+            'same_entity_recent_shown': len(compact_recent),
             'hidden_count': hidden_count,
         },
     }
@@ -3140,9 +3646,9 @@ def run_context_for_agent(conn: sqlite3.Connection, agent_id: str = "", agent: d
 def run_context_for_task(conn: sqlite3.Connection, task_id: str = "", task: dict | None = None) -> dict:
     row = dict(task or {})
     if not row and task_id:
-        fetched = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        fetched = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
         if fetched is not None:
-            row = dict(fetched)
+            row = normalize_task_row(fetched, conn)
     agent_ctx = run_context_for_agent(conn, str(row.get("agent_id") or "")) if row.get("agent_id") else {
         "agent_id": "",
         "agent_name_snapshot": "",
@@ -3155,6 +3661,12 @@ def run_context_for_task(conn: sqlite3.Connection, task_id: str = "", task: dict
     return {
         "agent_id": str(agent_ctx.get("agent_id") or ""),
         "agent_name_snapshot": str(agent_ctx.get("agent_name_snapshot") or ""),
+        "assignee_id": str(row.get("agent_id") or agent_ctx.get("agent_id") or ""),
+        "assignee_name": str(row.get("assigned_agent_name") or agent_ctx.get("agent_name_snapshot") or ""),
+        "playbook_id": str(row.get("playbook_id") or ""),
+        "playbook_name": str(row.get("linked_playbook_name") or ""),
+        "task_title_snapshot": str(row.get("title") or ""),
+        "result_text": str(row.get("result_text") or ""),
         "linked_task_id": str(row.get("id") or task_id or ""),
         "linked_task_title_snapshot": str(row.get("title") or ""),
         "deployment_id": str(agent_ctx.get("deployment_id") or ""),
@@ -3591,9 +4103,9 @@ def build_launch_target_snapshot(target_type: str, target_record: dict | None = 
 
 
 def create_run_record(conn: sqlite3.Connection, *, run_type: str, title: str, status: str = "queued", started_at: str | None = None,
-                      finished_at: str = "", summary: str = "", run_detail: str = "", result_label: str = "", result_summary: str = "", result_payload=None, artifact_manifest=None, artifact_count=None, output_status: str = "", error_message: str = "",
+                      finished_at: str = "", summary: str = "", run_detail: str = "", result_label: str = "", result_summary: str = "", result_text: str = "", result_payload=None, artifact_manifest=None, artifact_count=None, output_status: str = "", error_message: str = "",
                       log_preview: str = "", target_entity_type: str = "", target_entity_id: str = "", target_entity_name: str = "",
-                      trigger_label: str = "", changed_fields=None, metadata=None, agent_id: str = "", agent_name_snapshot: str = "",
+                      trigger_label: str = "", changed_fields=None, metadata=None, agent_id: str = "", agent_name_snapshot: str = "", assignee_id: str = "", assignee_name: str = "", playbook_id: str = "", playbook_name: str = "", task_title_snapshot: str = "",
                       linked_task_id: str = "", linked_task_title_snapshot: str = "", deployment_id: str = "",
                       deployment_target_snapshot: str = "", deployment_type_snapshot: str = "", target: str = "",
                       environment: str = "", origin: str = "live", run_source: str = "", run_purpose: str = "") -> dict:
@@ -3625,8 +4137,14 @@ def create_run_record(conn: sqlite3.Connection, *, run_type: str, title: str, st
         "trigger_label": trim_run_text(trigger_label, 80),
         "changed_fields_json": json.dumps(sanitize_changed_fields(changed_fields), ensure_ascii=False),
         "metadata_json": json.dumps(sanitize_run_metadata(metadata), ensure_ascii=False),
+        "task_title_snapshot": str(task_title_snapshot or linked_task_title_snapshot or ""),
+        "assignee_id": str(assignee_id or agent_id or ""),
+        "assignee_name": str(assignee_name or agent_name_snapshot or ""),
+        "playbook_id": str(playbook_id or ""),
+        "playbook_name": str(playbook_name or ""),
+        "result_text": trim_run_text(result_text or result_summary, 4000),
         "linked_task_id": str(linked_task_id or ""),
-        "linked_task_title_snapshot": str(linked_task_title_snapshot or ""),
+        "linked_task_title_snapshot": str(linked_task_title_snapshot or task_title_snapshot or ""),
         "deployment_id": str(deployment_id or ""),
         "deployment_target_snapshot": str(deployment_target_snapshot or ""),
         "deployment_type_snapshot": str(deployment_type_snapshot or ""),
@@ -3642,13 +4160,13 @@ def create_run_record(conn: sqlite3.Connection, *, run_type: str, title: str, st
           id, type, title, agent_id, agent_name_snapshot, target, environment, status, started_at, finished_at, summary,
           run_detail, result_label, result_summary, result_payload_json, artifact_count, artifact_manifest_json, output_status,
           error_message, log_preview, target_entity_type, target_entity_id, target_entity_name,
-          trigger_label, changed_fields_json, metadata_json, linked_task_id, linked_task_title_snapshot, deployment_id,
+          trigger_label, changed_fields_json, metadata_json, task_title_snapshot, assignee_id, assignee_name, playbook_id, playbook_name, result_text, linked_task_id, linked_task_title_snapshot, deployment_id,
           deployment_target_snapshot, deployment_type_snapshot, origin, run_source, run_purpose, created_at, updated_at
         ) VALUES (
           :id, :type, :title, :agent_id, :agent_name_snapshot, :target, :environment, :status, :started_at, :finished_at, :summary,
           :run_detail, :result_label, :result_summary, :result_payload_json, :artifact_count, :artifact_manifest_json, :output_status,
           :error_message, :log_preview, :target_entity_type, :target_entity_id, :target_entity_name,
-          :trigger_label, :changed_fields_json, :metadata_json, :linked_task_id, :linked_task_title_snapshot, :deployment_id,
+          :trigger_label, :changed_fields_json, :metadata_json, :task_title_snapshot, :assignee_id, :assignee_name, :playbook_id, :playbook_name, :result_text, :linked_task_id, :linked_task_title_snapshot, :deployment_id,
           :deployment_target_snapshot, :deployment_type_snapshot, :origin, :run_source, :run_purpose, :created_at, :updated_at
         )
         """,
@@ -3692,8 +4210,14 @@ def update_run_record(conn: sqlite3.Connection, run_id: str, **changes) -> dict:
     payload["trigger_label"] = trim_run_text(changes.get("trigger_label", current.get("trigger_label") or ""), 80)
     payload["changed_fields_json"] = json.dumps(sanitize_changed_fields(changes.get("changed_fields", current.get("changed_fields_json") or [])), ensure_ascii=False)
     payload["metadata_json"] = json.dumps(sanitize_run_metadata(changes.get("metadata", current.get("metadata_json") or {})), ensure_ascii=False)
+    payload["task_title_snapshot"] = str(changes.get("task_title_snapshot", current.get("task_title_snapshot") or current.get("linked_task_title_snapshot") or ""))
+    payload["assignee_id"] = str(changes.get("assignee_id", current.get("assignee_id") or current.get("agent_id") or ""))
+    payload["assignee_name"] = str(changes.get("assignee_name", current.get("assignee_name") or current.get("agent_name_snapshot") or ""))
+    payload["playbook_id"] = str(changes.get("playbook_id", current.get("playbook_id") or ""))
+    payload["playbook_name"] = str(changes.get("playbook_name", current.get("playbook_name") or ""))
+    payload["result_text"] = trim_run_text(changes.get("result_text", current.get("result_text") or current.get("result_summary") or ""), 4000)
     payload["linked_task_id"] = str(changes.get("linked_task_id", current.get("linked_task_id") or ""))
-    payload["linked_task_title_snapshot"] = str(changes.get("linked_task_title_snapshot", current.get("linked_task_title_snapshot") or ""))
+    payload["linked_task_title_snapshot"] = str(changes.get("linked_task_title_snapshot", current.get("linked_task_title_snapshot") or current.get("task_title_snapshot") or ""))
     payload["deployment_id"] = str(changes.get("deployment_id", current.get("deployment_id") or ""))
     payload["deployment_target_snapshot"] = str(changes.get("deployment_target_snapshot", current.get("deployment_target_snapshot") or ""))
     payload["deployment_type_snapshot"] = str(changes.get("deployment_type_snapshot", current.get("deployment_type_snapshot") or ""))
@@ -3729,6 +4253,12 @@ def update_run_record(conn: sqlite3.Connection, run_id: str, **changes) -> dict:
             trigger_label = :trigger_label,
             changed_fields_json = :changed_fields_json,
             metadata_json = :metadata_json,
+            task_title_snapshot = :task_title_snapshot,
+            assignee_id = :assignee_id,
+            assignee_name = :assignee_name,
+            playbook_id = :playbook_id,
+            playbook_name = :playbook_name,
+            result_text = :result_text,
             linked_task_id = :linked_task_id,
             linked_task_title_snapshot = :linked_task_title_snapshot,
             deployment_id = :deployment_id,
@@ -3856,14 +4386,36 @@ def runs_cleanup(action: str, *, reseed: bool = False) -> dict:
         }
 
 
-def run_list() -> list[dict]:
+def run_list(*, task_id: str = '') -> list[dict]:
     with connect_board() as conn:
-        rows = conn.execute(
-            RUN_SELECT + " ORDER BY CASE r.status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END, r.started_at DESC, r.updated_at DESC"
-        ).fetchall()
+        clauses = []
+        params = []
+        if task_id:
+            clauses.append("r.linked_task_id = ?")
+            params.append(task_id)
+        query = RUN_SELECT
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY CASE r.status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'queued' THEN 2 WHEN 'cancelled' THEN 3 ELSE 4 END, r.started_at DESC, r.updated_at DESC"
+        rows = conn.execute(query, params).fetchall()
         items = [normalize_run_row(row) for row in rows]
         non_demo = [item for item in items if not is_demo_run_row(item)]
         return non_demo if non_demo else items
+
+
+def task_runs_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    if not task_id:
+        return []
+    rows = conn.execute(
+        RUN_SELECT + " WHERE r.linked_task_id = ? AND lower(COALESCE(r.run_source, '')) = 'task' AND lower(COALESCE(r.run_purpose, '')) IN ('execution', 'task_execution') ORDER BY COALESCE(NULLIF(r.started_at, ''), r.created_at) DESC, r.created_at DESC, r.id DESC",
+        (task_id,),
+    ).fetchall()
+    return [normalize_run_row(row) for row in rows if row is not None]
+
+
+def task_latest_run(conn: sqlite3.Connection, task_id: str) -> dict | None:
+    runs = task_runs_list(conn, task_id)
+    return runs[0] if runs else None
 
 
 def run_get(run_id: str):
@@ -3874,6 +4426,152 @@ def run_get(run_id: str):
         if row is None:
             raise ResourceNotFoundError('run', run_id)
         return {"run": normalize_run_row(row)}
+
+
+def run_rows_for_cleanup_scope(conn: sqlite3.Connection, scope: str) -> list[dict]:
+    normalized = str(scope or '').strip().lower()
+    if normalized not in {'cancelled', 'failed', 'completed', 'verification', 'all'}:
+        raise ValueError('scope must be one of: cancelled, failed, completed, verification, all')
+    rows = conn.execute('SELECT * FROM runs').fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        status = display_run_status(item.get('status') or '')
+        if normalized == 'all':
+            items.append(item)
+        elif normalized == 'verification' and is_verification_run_row(item):
+            items.append(item)
+        elif normalized in {'cancelled', 'failed'} and status == normalized:
+            items.append(item)
+        elif normalized == 'completed' and status in {'completed', 'success'}:
+            items.append(item)
+    return items
+
+
+def delete_runs_by_ids(conn: sqlite3.Connection, run_ids: list[str]) -> int:
+    ids = [str(run_id or '').strip() for run_id in run_ids if str(run_id or '').strip()]
+    if not ids:
+        return 0
+    placeholders = ','.join('?' for _ in ids)
+    conn.execute(f'DELETE FROM run_trace_events WHERE run_id IN ({placeholders})', tuple(ids))
+    conn.execute(f'DELETE FROM runs WHERE id IN ({placeholders})', tuple(ids))
+    return len(ids)
+
+
+def clear_runs(scope: str) -> dict:
+    with connect_board() as conn:
+        rows = run_rows_for_cleanup_scope(conn, scope)
+        run_ids = [str(row.get('id') or '') for row in rows if str(row.get('id') or '')]
+        deleted = delete_runs_by_ids(conn, run_ids)
+        conn.commit()
+        return {'ok': True, 'scope': str(scope or '').strip().lower(), 'deleted': deleted, 'deleted_ids': run_ids}
+
+
+def delete_run_record(run_id: str) -> dict:
+    if not run_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute('SELECT * FROM runs WHERE id = ?', (run_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('run', run_id)
+        deleted = delete_runs_by_ids(conn, [run_id])
+        conn.commit()
+        return {'ok': True, 'deleted': deleted, 'run_id': run_id}
+
+
+def task_execution_run_payload(task: dict, *, summary: str = '', result_text: str = '', log_preview: str = '') -> dict:
+    return {
+        'run_type': 'task_run',
+        'title': trim_run_text(f"Run task: {task.get('title') or 'Untitled task'}", 140),
+        'status': 'queued',
+        'summary': trim_run_text(summary or f"Execution queued for task \"{task.get('title') or 'Untitled task'}\".", 220),
+        'run_detail': trim_run_text(f"Operator started a manual execution run from the task inspector.", 420),
+        'result_label': 'Queued',
+        'result_summary': trim_run_text(summary, 220),
+        'result_text': result_text,
+        'log_preview': trim_run_text(log_preview or 'Run queued from task inspector.', 420),
+        'trigger_label': 'Task inspector execution',
+        'run_source': 'task',
+        'run_purpose': 'execution',
+    }
+
+
+def create_task_execution_run(task_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError('task not found')
+        task = normalize_task_row(row, conn)
+        if task.get('status') != 'ready':
+            raise ValueError('Only ready tasks can start a run')
+        latest = task_latest_run(conn, task_id)
+        if latest and latest.get('display_status') in {'queued', 'running'}:
+            raise ValueError('Task already has an active run')
+        summary = str(payload.get('summary') or '').strip()
+        result_text = str(payload.get('resultText', payload.get('result_text', '')) or '').strip()
+        log_preview = str(payload.get('logPreview', payload.get('log_preview', payload.get('note', ''))) or '').strip()
+        base = task_execution_run_payload(task, summary=summary, result_text=result_text, log_preview=log_preview)
+        ctx = run_context_for_task(conn, task_id=task_id, task=task)
+        create_ctx = {key: value for key, value in ctx.items() if key != 'result_text'}
+        run = create_run_record(conn, **base, **create_ctx)
+        task_event_create(conn, task_id, 'run_created', f"Run created for task \"{task.get('title') or 'Untitled task'}\".", note=summary or log_preview, metadata={'run_id': run['id'], 'run_status': 'queued'})
+        append_trace_event(conn, run['id'], event_type='queued', event_label='Run created', event_detail='Execution run created from the task inspector.', event_status='success', metadata={'task_id': task_id})
+        mark_run_running(conn, run['id'], summary=trim_run_text(summary or f"Execution running for task \"{task.get('title') or 'Untitled task'}\".", 220), run_detail='Operator is driving the run manually from the task inspector.', result_label='Running', result_summary=trim_run_text(summary, 220), result_text=result_text, output_status='running', log_preview=trim_run_text(log_preview or 'Run started from task inspector.', 420), trigger_label='Task inspector execution', **create_ctx)
+        append_trace_event(conn, run['id'], event_type='step', event_label='Run started', event_detail='Task execution is now in progress under operator control.', event_status='running', metadata={'task_id': task_id})
+        previous_status = task.get('status') or ''
+        now = utc_now()
+        conn.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", ('in_progress', now, task_id))
+        task_event_create(conn, task_id, 'run_started', f"Run started for task \"{task.get('title') or 'Untitled task'}\".", note=summary or log_preview, metadata={'run_id': run['id'], 'run_status': 'running'})
+        task_event_create(conn, task_id, 'status_changed', 'Status changed from Ready to In Progress.', note=summary or log_preview, metadata={'from_status': previous_status, 'to_status': 'in_progress', 'run_id': run['id']})
+        conn.commit()
+        return task_get(task_id)
+
+
+def update_task_execution_run(run_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    requested_status = display_run_status(payload.get('status') or '')
+    if requested_status not in {'completed', 'failed', 'cancelled'}:
+        raise ValueError('Run update status must be one of: completed, failed, cancelled')
+    summary = str(payload.get('summary') or '').strip()
+    result_text = str(payload.get('resultText', payload.get('result_text', '')) or '').strip()
+    log_preview = str(payload.get('logPreview', payload.get('log_preview', payload.get('note', ''))) or '').strip()
+    fallback_task_status = 'triage' if requested_status == 'cancelled' else ('review' if requested_status == 'completed' else 'blocked')
+    with connect_board() as conn:
+        row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('run', run_id)
+        run = normalize_run_row(row)
+        task_id = str(run.get('linked_task_id') or run.get('task_id') or '')
+        if not task_id:
+            raise ValueError('Run is not linked to a task')
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise KeyError('task not found')
+        task = normalize_task_row(task_row, conn)
+        if run.get('display_status') not in {'queued', 'running'}:
+            raise ValueError('Only active runs can be updated from the execution controls')
+        output_status = 'success' if requested_status == 'completed' else ('failed' if requested_status == 'failed' else 'empty')
+        result_label = 'Completed' if requested_status == 'completed' else ('Failed' if requested_status == 'failed' else 'Cancelled')
+        final_summary = summary or (f"Run completed for task \"{task.get('title') or 'Untitled task'}\"." if requested_status == 'completed' else f"Run {requested_status} for task \"{task.get('title') or 'Untitled task'}\".")
+        final_note = log_preview or summary
+        now = utc_now()
+        update_run_record(conn, run_id, status=requested_status, summary=trim_run_text(final_summary, 220), result_summary=trim_run_text(summary or result_text or final_summary, 220), result_text=result_text, result_label=result_label, output_status=output_status, log_preview=trim_run_text(log_preview or final_summary, 420), error_message=(summary or log_preview) if requested_status == 'failed' else '', trigger_label='Task inspector execution', finished_at=now)
+        trace_event_type = 'completed' if requested_status == 'completed' else ('failed' if requested_status == 'failed' else 'cancelled')
+        trace_event_status = 'success' if requested_status == 'completed' else ('failed' if requested_status == 'failed' else 'skipped')
+        append_trace_event(conn, run_id, event_type=trace_event_type, event_label=f'Run {result_label.lower()}', event_detail=trim_run_text(final_summary, 220), event_status=trace_event_status, metadata={'task_id': task_id, 'task_status': fallback_task_status})
+        blocked_reason = task.get('blocked_reason') or ''
+        if requested_status == 'failed':
+            blocked_reason = final_note or blocked_reason or 'Run failed.'
+        elif requested_status == 'cancelled':
+            blocked_reason = ''
+        conn.execute("UPDATE tasks SET status = ?, result_text = ?, last_note = ?, blocked_reason = ?, updated_at = ? WHERE id = ?", (fallback_task_status, result_text or task.get('result_text') or '', final_note or task.get('last_note') or '', blocked_reason, now, task_id))
+        task_event_create(conn, task_id, f'run_{requested_status}', f"Run {requested_status} for task \"{task.get('title') or 'Untitled task'}\".", note=final_note or result_text, metadata={'run_id': run_id, 'run_status': requested_status, 'task_status': fallback_task_status})
+        task_event_create(conn, task_id, 'status_changed', f"Status changed from {str(task.get('status') or '').replace('_', ' ').title() or 'Unknown'} to {fallback_task_status.replace('_', ' ').title()}.", note=final_note or result_text, metadata={'from_status': task.get('status') or '', 'to_status': fallback_task_status, 'run_id': run_id})
+        if result_text and result_text != str(task.get('result_text') or ''):
+            task_event_create(conn, task_id, 'result_saved', 'Result/output updated.', note=result_text, metadata={'has_result': True, 'run_id': run_id})
+        conn.commit()
+        return task_get(task_id)
 
 
 def run_context_get(run_id: str):
@@ -3946,7 +4644,7 @@ def create_trace_probe(payload: dict):
             log_preview='Queued runtime probe for execution trace verification.',
             metadata=base_metadata,
             run_source='verification',
-            run_purpose='agent_execution',
+            run_purpose='smoke_test',
             origin='live',
             **agent_ctx,
         )
@@ -4129,8 +4827,8 @@ def launch_operator_run(payload: dict):
             trigger_label='Run evaluation',
             log_preview=f"Queued operator evaluation for {target_label}.",
             metadata=metadata,
-            run_source='user',
-            run_purpose='evaluation',
+            run_source=('task' if target_type == 'task' else ('deployment' if target_type == 'deployment' else 'runtime')),
+            run_purpose=('smoke_test' if requested_failure_check else 'execution'),
             origin='live',
             **target_ctx,
         )
@@ -4935,6 +5633,32 @@ class Handler(BaseHTTPRequestHandler):
         parsed = parse_qs(raw)
         return {k: v[-1] if v else "" for k, v in parsed.items()}
 
+    def read_multipart_form(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        return cgi.FieldStorage(
+            fp=io.BytesIO(raw),
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": self.command,
+                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                "CONTENT_LENGTH": str(length),
+            },
+            keep_blank_values=True,
+        )
+
+    def send_binary(self, body: bytes, *, content_type: str = 'application/octet-stream', filename: str = ''):
+        payload = body or b''
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            safe_name = filename.replace('\"', '')
+            self.send_header("Content-Disposition", f'inline; filename="{safe_name}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def send_api_error(self, exc: Exception, *, fallback_boundary: str = 'request_error', fallback_code: str = 'bad_request'):
         status, payload = exception_to_api_error(exc, fallback_boundary=fallback_boundary, fallback_code=fallback_code)
         self.send_json(payload, status)
@@ -4956,7 +5680,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/snapshot":
             self.send_json(snapshot())
             return
+        task_history_match = re.fullmatch(r"/api/tasks/([^/]+)/history", parsed.path)
+        task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+        task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
+        task_attachment_content_match = re.fullmatch(r"/api/task-attachments/([^/]+)/content", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
         run_trace_match = re.fullmatch(r"/api/runs/([^/]+)/trace", parsed.path)
         run_context_match = re.fullmatch(r"/api/runs/([^/]+)/context", parsed.path)
@@ -4967,11 +5695,39 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tasks":
             self.send_json({"tasks": task_list()})
             return
+        if task_history_match:
+            try:
+                self.send_json(task_history_get(task_history_match.group(1)))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+            return
+        if task_runs_match:
+            try:
+                self.send_json(task_runs_get(task_runs_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='task_runs_failed', fallback_code='task_runs_failed')
+            return
         if task_match:
             try:
                 self.send_json(task_get(task_match.group(1)))
             except Exception as exc:
                 self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+            return
+        if task_attachment_content_match:
+            try:
+                attachment = task_attachment_get(task_attachment_content_match.group(1))
+                path = task_attachment_absolute_path(attachment.get('storage_path') or attachment.get('storage_rel_path') or '')
+                if not path.exists() or not path.is_file():
+                    raise FileNotFoundError('attachment content not found')
+                self.send_binary(path.read_bytes(), content_type=attachment.get('mime_type') or 'application/octet-stream', filename=attachment.get('filename') or 'attachment')
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='attachment_content_failed', fallback_code='attachment_content_failed')
+            return
+        if task_attachment_match:
+            try:
+                self.send_json({'attachment': task_attachment_get(task_attachment_match.group(1))})
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='attachment_detail_failed', fallback_code='attachment_detail_failed')
             return
         if parsed.path == "/api/playbooks":
             self.send_json({"playbooks": playbook_list()})
@@ -5062,6 +5818,17 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         try:
+            if parsed.path == "/api/task-attachments/upload":
+                form = self.read_multipart_form()
+                file_item = form['file'] if 'file' in form else None
+                if file_item is None or not getattr(file_item, 'filename', ''):
+                    raise ValueError('file is required')
+                file_bytes = file_item.file.read() if getattr(file_item, 'file', None) else b''
+                draft_token = form.getfirst('draft_token', '') if hasattr(form, 'getfirst') else ''
+                task_id = form.getfirst('task_id', '') if hasattr(form, 'getfirst') else ''
+                attachment = task_attachment_create(file_bytes, getattr(file_item, 'filename', ''), getattr(file_item, 'type', ''), draft_token=draft_token, task_id=task_id)
+                self.send_json({'attachment': attachment}, 201)
+                return
             payload = self.read_payload()
             if parsed.path == "/api/board":
                 self.send_json({"task": board_create(payload)}, 201)
@@ -5112,6 +5879,21 @@ class Handler(BaseHTTPRequestHandler):
                 except RunLaunchRequestError as exc:
                     self.send_api_error(exc, fallback_boundary='launch_rejected', fallback_code='invalid_launch')
                 return
+            if parsed.path == "/api/runs":
+                self.send_json(create_task_execution_run(str((payload or {}).get('taskId') or (payload or {}).get('task_id') or '').strip(), payload), 201)
+                return
+            if parsed.path == "/api/runs/update":
+                run_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
+                self.send_json(update_task_execution_run(run_id, payload))
+                return
+            if parsed.path == "/api/runs/clear":
+                scope = str((payload or {}).get('scope') or (qs.get('scope') or [''])[0] or '').strip().lower()
+                self.send_json(clear_runs(scope))
+                return
+            if parsed.path == "/api/runs/delete":
+                run_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
+                self.send_json(delete_run_record(run_id))
+                return
             if parsed.path == "/api/board/update":
                 task_id = (qs.get("id") or [""])[0]
                 self.send_json({"task": board_update(task_id, payload)})
@@ -5130,14 +5912,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         parsed = urlparse(self.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+        task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
-        if not task_match and not deployment_match:
+        run_match = re.fullmatch(r"/api/runs/([^/]+)", parsed.path)
+        if not task_match and not task_attachment_match and not deployment_match and not run_match:
             self.send_error(404, "not found")
             return
         try:
             payload = self.read_payload()
             if task_match:
                 self.send_json({"task": task_update(task_match.group(1), payload)})
+                return
+            if run_match:
+                self.send_json(update_task_execution_run(run_match.group(1), payload))
                 return
             self.send_json({"deployment": deployment_update(deployment_match.group(1), payload)})
         except Exception as exc:
@@ -5153,6 +5940,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if task_match:
                 self.send_json(task_delete(task_match.group(1)))
+                return
+            if task_attachment_match:
+                self.send_json(task_attachment_delete(task_attachment_match.group(1)))
                 return
             self.send_json(deployment_delete(deployment_match.group(1)))
         except Exception as exc:
