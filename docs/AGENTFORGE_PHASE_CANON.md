@@ -324,13 +324,57 @@ Next recommended phase:
 - Implementation Phase 13 — Proposals V1
 - now that tasks can retain durable outputs and lessons, the next highest-value layer is turning that preserved context into explicit operator-visible improvement proposals
 
+### Implementation Phase 13 — Proposals V1
+Status: confirmed complete
+Date: 2026-06-11
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/docs/AGENTFORGE_HANDOFF_CHECKLIST.md`
+
+What shipped:
+- Proposals tab added inside the shared task workspace so operators can capture structured improvement suggestions without leaving the task flow
+- proposal records now preserve title, content, proposal type, status, source task linkage, optional run linkage, optional memory linkage, audit-state context, and a context summary snapshot
+- task detail now surfaces linked proposals plus proposal count alongside existing run, audit, delegation, and memory data
+- linked proposals can be reopened inside the same workspace and their status can be advanced through proposed, accepted, rejected, or applied
+- proposal lifecycle changes now append readable task history events so the proposal trail stays visible from the same task record
+
+Routes / data changes:
+- new table: `proposals`
+- new proposal fields: `id`, `title`, `content`, `proposal_type`, `status`, `source_task_id`, `source_run_id`, `source_memory_id`, `source_audit_state`, `source_context_summary`, `created_at`, `updated_at`
+- new list/detail routes: `GET /api/proposals`, `GET /api/proposals/:id`
+- new task-linked route: `GET /api/tasks/:id/proposals`
+- new write route: `POST /api/proposals`
+- new update route: `PUT /api/proposals/:id`
+- additive task detail/list fields: `proposal_count`, `linked_proposals`
+- task history events added: `proposal_created`, `proposal_updated`, `proposal_status_updated`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for task create/update, memory create, proposal create/update, task-linked proposal retrieval, and preserved child delegation linkage
+- cleanup sweep removed stale temporary Phase 13 verification artifacts and confirmed marker absence in DB/API/UI results
+- manual browser QA from Tasks and Kanban with shared workspace open, Proposals tab visible, proposal save/readback, and live status update actions
+- live runtime confirmed on `http://127.0.0.1:50000` with startup proof from the active `server.py` process
+
+Deferred:
+- automatic proposal generation from models or runs
+- proposal approval policies that mutate structure automatically
+- proposal analytics, batching, or cross-task proposal queues
+
+Next recommended phase:
+- Implementation Phase 14 — Approval-Governed Adaptation V1
+- proposals are now explicit and reviewable; the next highest-value layer is turning accepted proposals into safe, human-approved structural adaptation instead of passive suggestion storage
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, and memory capture in one shared flow**
+- **task workspace is real and now includes execution, audit, delegation, memory capture, and proposals in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -342,15 +386,16 @@ What feels strongest now:
 - task-level audit workflow
 - manual parent/child delegation inside the task workspace
 - task-linked memory capture and retrieval
+- task-linked proposal capture and lifecycle updates
 
 What is still clearly missing from the canon product:
 - full Agents overhaul
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
-- Proposals system
 - Approval-governed adaptation layer
 - deeper task workspace richness beyond V1
 - richer vault intelligence beyond operator-curated V1 capture
+- proposal automation beyond operator-driven V1 capture
 
 ---
 
@@ -359,20 +404,20 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 13 — Proposals V1**
+**Implementation Phase 14 — Approval-Governed Adaptation V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, and durable memory capture
-- the highest-value remaining gap is turning preserved task/run/memory context into explicit operator-visible improvement proposals
-- Proposals V1 fits naturally after Memory Vault because it can reuse linked outputs, lessons, and audit history instead of inventing context from scratch
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, and explicit proposal records
+- the highest-value remaining gap is deciding how accepted proposals can safely change behavior without allowing silent structural drift
+- Approval-Governed Adaptation V1 fits naturally after Proposals because it can use accepted proposal records as the explicit approval gate for controlled system change
 
-Proposals V1 should likely add:
-- additive proposal records tied to tasks, runs, and optionally vault memories
-- clear operator-visible suggestion cards with approve/reject states
-- proposal generation focused on workflow improvements, next actions, or system refinements without mutating structure automatically
+Approval-Governed Adaptation V1 should likely add:
+- explicit approval flow that only promotes accepted proposals into change candidates
+- a governed adaptation record tying proposal -> approval decision -> applied outcome
+- operator-visible safeguards so accepted ideas still require deliberate execution, logging, and rollback-aware state changes
 
 Alternative after that:
-- deeper Delegation V2 or approval-governed adaptation groundwork
+- deeper Delegation V2 or richer proposal generation/analytics
 
 ---
 
@@ -441,12 +486,13 @@ Current reality:
 - Audit V1 is real
 - Delegation V1 is now real
 - Memory Vault V1 is now real
+- Proposals V1 is now real
 
 Main missing product layers:
-- Proposals
 - approval-governed adaptation
 - deeper delegation/orchestration depth
 - richer memory intelligence beyond curated V1 capture
+- richer proposal automation beyond operator-driven V1
 
-Current best next step after Phase 12:
-- **Implementation Phase 13 — Proposals V1**
+Current best next step after Phase 13:
+- **Implementation Phase 14 — Approval-Governed Adaptation V1**

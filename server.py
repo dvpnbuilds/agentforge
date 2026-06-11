@@ -39,6 +39,8 @@ TASK_ATTACHMENT_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", 
 TASK_ATTACHMENT_ALLOWED_MIME_PREFIXES = ("image/", "text/")
 TASK_ATTACHMENT_ALLOWED_MIME_TYPES = {"application/pdf", "application/json", "application/msword", "application/rtf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.oasis.opendocument.text"}
 VAULT_MEMORY_TYPES = ["note", "lesson", "decision", "output", "prompt", "research", "system"]
+PROPOSAL_TYPES = ["workflow", "quality", "audit", "delegation", "memory", "prompt", "automation", "other"]
+PROPOSAL_STATUSES = ["proposed", "accepted", "rejected", "applied"]
 TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
 TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
@@ -1135,6 +1137,27 @@ def init_board():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_records_run_id ON vault_records(source_run_id, updated_at DESC, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_records_type ON vault_records(memory_type, updated_at DESC, created_at DESC)")
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS proposals (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              proposal_type TEXT DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'proposed',
+              source_task_id TEXT NOT NULL,
+              source_run_id TEXT DEFAULT '',
+              source_memory_id TEXT DEFAULT '',
+              source_audit_state TEXT DEFAULT '',
+              source_context_summary TEXT DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_task_id ON proposals(source_task_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_run_id ON proposals(source_run_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_memory_id ON proposals(source_memory_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_type ON proposals(proposal_type, updated_at DESC, created_at DESC)")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS playbooks (
               id TEXT PRIMARY KEY,
               slug TEXT NOT NULL UNIQUE,
@@ -1421,6 +1444,16 @@ def normalize_vault_memory_type(value) -> str:
     return raw if raw in VAULT_MEMORY_TYPES else ''
 
 
+def normalize_proposal_type(value) -> str:
+    raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
+    return raw if raw in PROPOSAL_TYPES else 'other'
+
+
+def normalize_proposal_status(value) -> str:
+    raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
+    return raw if raw in PROPOSAL_STATUSES else 'proposed'
+
+
 def parse_task_dependency_ids(value) -> list[str]:
     ids = []
     seen = set()
@@ -1560,6 +1593,8 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['childCount'] = len(child_tasks)
     item['memory_count'] = task_memory_count(conn, item['id'])
     item['memoryCount'] = item['memory_count']
+    item['proposal_count'] = task_proposal_count(conn, item['id'])
+    item['proposalCount'] = item['proposal_count']
     return item
 
 
@@ -1606,6 +1641,13 @@ def task_memory_count(conn: sqlite3.Connection, task_id: str) -> int:
     if not task_id:
         return 0
     row = conn.execute("SELECT COUNT(*) AS count FROM vault_records WHERE source_task_id = ?", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def task_proposal_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM proposals WHERE source_task_id = ?", (task_id,)).fetchone()
     return int((row['count'] if row else 0) or 0)
 
 
@@ -1670,6 +1712,295 @@ def vault_records_list(query: str = '', task_id: str = '', run_id: str = '') -> 
         rows = conn.execute(sql, tuple(params)).fetchall()
         memories = [normalize_vault_record_row(row, conn) for row in rows if row is not None]
         return {'memories': memories, 'count': len(memories), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id}
+
+
+def normalize_proposal_row(row, conn: sqlite3.Connection | None = None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    item['id'] = str(item.get('id') or '')
+    item['title'] = str(item.get('title') or '')
+    item['content'] = str(item.get('content') or '')
+    item['proposal_type'] = normalize_proposal_type(item.get('proposal_type') or '')
+    item['status'] = normalize_proposal_status(item.get('status') or '')
+    item['source_task_id'] = str(item.get('source_task_id') or '')
+    item['source_run_id'] = str(item.get('source_run_id') or '')
+    item['source_memory_id'] = str(item.get('source_memory_id') or '')
+    item['source_audit_state'] = normalize_audit_state(item.get('source_audit_state') or '')
+    item['source_context_summary'] = str(item.get('source_context_summary') or '')
+    item['created_at'] = str(item.get('created_at') or '')
+    item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
+    item['proposalType'] = item['proposal_type']
+    item['sourceTaskId'] = item['source_task_id']
+    item['sourceRunId'] = item['source_run_id']
+    item['sourceMemoryId'] = item['source_memory_id']
+    item['sourceAuditState'] = item['source_audit_state']
+    item['sourceContextSummary'] = item['source_context_summary']
+    item['createdAt'] = item['created_at']
+    item['updatedAt'] = item['updated_at']
+    item['source_task'] = None
+    item['source_run'] = None
+    item['source_memory'] = None
+    if conn is not None and item['source_task_id']:
+        item['source_task'] = task_parent_summary(conn, item['source_task_id'])
+    if conn is not None and item['source_run_id']:
+        run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (item['source_run_id'],)).fetchone()
+        if run_row is not None:
+            run = normalize_run_row(run_row)
+            item['source_run'] = {
+                'id': str(run.get('id') or ''),
+                'status': str(run.get('display_status') or run.get('status') or ''),
+                'title': str(run.get('title') or ''),
+                'summary': str(run.get('summary') or ''),
+                'task_id': str(run.get('linked_task_id') or run.get('task_id') or ''),
+                'task_title_snapshot': str(run.get('linked_task_title_snapshot') or run.get('task_title_snapshot') or ''),
+                'updated_at': str(run.get('updated_at') or run.get('finished_at') or run.get('started_at') or run.get('created_at') or ''),
+            }
+    if conn is not None and item['source_memory_id']:
+        memory_row = conn.execute("SELECT * FROM vault_records WHERE id = ?", (item['source_memory_id'],)).fetchone()
+        if memory_row is not None:
+            memory = normalize_vault_record_row(memory_row, conn)
+            item['source_memory'] = {
+                'id': str(memory.get('id') or ''),
+                'title': str(memory.get('title') or ''),
+                'memory_type': str(memory.get('memory_type') or ''),
+                'updated_at': str(memory.get('updated_at') or memory.get('created_at') or ''),
+            }
+    return item
+
+
+def task_proposals_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    if not task_id:
+        return []
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM proposals
+        WHERE source_task_id = ?
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        """,
+        (task_id,),
+    ).fetchall()
+    return [normalize_proposal_row(row, conn) for row in rows if row is not None]
+
+
+def task_proposals_get(task_id: str):
+    if not task_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError('task not found')
+        task = normalize_task_row(row, conn)
+        proposals = task_proposals_list(conn, task_id)
+        return {'task_id': task_id, 'task_title': task.get('title') or '', 'proposals': proposals, 'proposal_count': len(proposals)}
+
+
+def proposal_record_get(proposal_id: str):
+    if not proposal_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        return {'proposal': normalize_proposal_row(row, conn)}
+
+
+def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', memory_id: str = '', status: str = '') -> dict:
+    with connect_board() as conn:
+        where = []
+        params: list[str] = []
+        clean_query = str(query or '').strip()
+        clean_task_id = str(task_id or '').strip()
+        clean_run_id = str(run_id or '').strip()
+        clean_memory_id = str(memory_id or '').strip()
+        clean_status = normalize_proposal_status(status) if str(status or '').strip() else ''
+        if clean_task_id:
+            where.append("source_task_id = ?")
+            params.append(clean_task_id)
+        if clean_run_id:
+            where.append("source_run_id = ?")
+            params.append(clean_run_id)
+        if clean_memory_id:
+            where.append("source_memory_id = ?")
+            params.append(clean_memory_id)
+        if clean_status:
+            where.append("status = ?")
+            params.append(clean_status)
+        if clean_query:
+            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(proposal_type) LIKE ? OR lower(source_context_summary) LIKE ?)")
+            needle = f"%{clean_query.lower()}%"
+            params.extend([needle, needle, needle, needle])
+        sql = "SELECT * FROM proposals"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, created_at DESC, id DESC"
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        proposals = [normalize_proposal_row(row, conn) for row in rows if row is not None]
+        return {'proposals': proposals, 'count': len(proposals), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id, 'source_memory_id': clean_memory_id, 'status': clean_status}
+
+
+def proposal_record_create(payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    title = str(payload.get('title') or '').strip()
+    content = str(payload.get('content', payload.get('rationale', payload.get('note', ''))) or '').strip()
+    proposal_type = normalize_proposal_type(payload.get('proposal_type', payload.get('type', payload.get('proposalType', 'other'))))
+    status = normalize_proposal_status(payload.get('status', payload.get('proposal_status', payload.get('proposalStatus', 'proposed'))))
+    source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
+    source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', payload.get('runId', '')))) or '').strip()
+    source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', payload.get('memoryId', '')))) or '').strip()
+    source_audit_state = normalize_audit_state(payload.get('source_audit_state', payload.get('audit_state', payload.get('sourceAuditState', payload.get('auditState', '')))))
+    source_context_summary = str(payload.get('source_context_summary', payload.get('context_summary', payload.get('sourceContextSummary', payload.get('contextSummary', '')))) or '').strip()
+    if not title:
+        raise ValueError('title is required')
+    if not content:
+        raise ValueError('content is required')
+    if not source_task_id:
+        raise ValueError('source_task_id is required')
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (source_task_id,)).fetchone()
+        if task_row is None:
+            raise ValueError('source_task_id does not match an existing task')
+        task = normalize_task_row(task_row, conn)
+        run = None
+        memory = None
+        if source_run_id:
+            run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (source_run_id,)).fetchone()
+            if run_row is None:
+                raise ValueError('source_run_id does not match an existing run')
+            run = normalize_run_row(run_row)
+            linked_task_id = str(run.get('linked_task_id') or run.get('task_id') or '')
+            if linked_task_id and linked_task_id != source_task_id:
+                raise ValueError('source_run_id is linked to a different task')
+        if source_memory_id:
+            memory_row = conn.execute("SELECT * FROM vault_records WHERE id = ?", (source_memory_id,)).fetchone()
+            if memory_row is None:
+                raise ValueError('source_memory_id does not match an existing memory record')
+            memory = normalize_vault_record_row(memory_row, conn)
+            if str(memory.get('source_task_id') or '') != source_task_id:
+                raise ValueError('source_memory_id is linked to a different task')
+        if not source_audit_state:
+            source_audit_state = normalize_audit_state(task.get('audit_state') or '')
+        if not source_context_summary:
+            summary_bits = [task.get('title') or '', task.get('last_note') or '', task.get('result_text') or '', run.get('summary') if run else '', memory.get('title') if memory else '']
+            source_context_summary = trim_run_text(' | '.join(bit.strip() for bit in summary_bits if str(bit or '').strip()), 280)
+        now = utc_now()
+        item = {
+            'id': uuid.uuid4().hex,
+            'title': title,
+            'content': content,
+            'proposal_type': proposal_type,
+            'status': status,
+            'source_task_id': source_task_id,
+            'source_run_id': source_run_id,
+            'source_memory_id': source_memory_id,
+            'source_audit_state': source_audit_state,
+            'source_context_summary': source_context_summary,
+            'created_at': now,
+            'updated_at': now,
+        }
+        conn.execute(
+            """
+            INSERT INTO proposals (
+              id, title, content, proposal_type, status, source_task_id, source_run_id, source_memory_id, source_audit_state, source_context_summary, created_at, updated_at
+            ) VALUES (
+              :id, :title, :content, :proposal_type, :status, :source_task_id, :source_run_id, :source_memory_id, :source_audit_state, :source_context_summary, :created_at, :updated_at
+            )
+            """,
+            item,
+        )
+        task_event_create(
+            conn,
+            source_task_id,
+            'proposal_created',
+            f"Proposal created: {title}.",
+            note=content,
+            metadata={
+                'proposal_id': item['id'],
+                'proposal_type': proposal_type,
+                'status': status,
+                'source_run_id': source_run_id,
+                'source_memory_id': source_memory_id,
+                'source_audit_state': source_audit_state,
+            },
+        )
+        conn.commit()
+        proposal = normalize_proposal_row(item, conn)
+        return {'proposal': proposal, 'task': task, 'source_run': run, 'source_memory': memory}
+
+
+def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    if not proposal_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        existing_row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if existing_row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        existing = normalize_proposal_row(existing_row, conn)
+        title = str(payload.get('title', existing.get('title') or '') or '').strip()
+        content = str(payload.get('content', payload.get('rationale', existing.get('content') or '')) or '').strip()
+        proposal_type = normalize_proposal_type(payload.get('proposal_type', payload.get('type', payload.get('proposalType', existing.get('proposal_type') or 'other'))))
+        status = normalize_proposal_status(payload.get('status', payload.get('proposal_status', payload.get('proposalStatus', existing.get('status') or 'proposed'))))
+        source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', existing.get('source_run_id') or ''))) or '').strip()
+        source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', existing.get('source_memory_id') or ''))) or '').strip()
+        source_audit_state = normalize_audit_state(payload.get('source_audit_state', payload.get('audit_state', payload.get('sourceAuditState', existing.get('source_audit_state') or ''))))
+        source_context_summary = str(payload.get('source_context_summary', payload.get('context_summary', payload.get('sourceContextSummary', existing.get('source_context_summary') or ''))) or '').strip()
+        if not title:
+            raise ValueError('title is required')
+        if not content:
+            raise ValueError('content is required')
+        if source_run_id:
+            run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (source_run_id,)).fetchone()
+            if run_row is None:
+                raise ValueError('source_run_id does not match an existing run')
+            run = normalize_run_row(run_row)
+            linked_task_id = str(run.get('linked_task_id') or run.get('task_id') or '')
+            if linked_task_id and linked_task_id != existing.get('source_task_id'):
+                raise ValueError('source_run_id is linked to a different task')
+        if source_memory_id:
+            memory_row = conn.execute("SELECT * FROM vault_records WHERE id = ?", (source_memory_id,)).fetchone()
+            if memory_row is None:
+                raise ValueError('source_memory_id does not match an existing memory record')
+            memory = normalize_vault_record_row(memory_row, conn)
+            if str(memory.get('source_task_id') or '') != existing.get('source_task_id'):
+                raise ValueError('source_memory_id is linked to a different task')
+        item = {
+            'id': proposal_id,
+            'title': title,
+            'content': content,
+            'proposal_type': proposal_type,
+            'status': status,
+            'source_run_id': source_run_id,
+            'source_memory_id': source_memory_id,
+            'source_audit_state': source_audit_state,
+            'source_context_summary': source_context_summary,
+            'updated_at': utc_now(),
+        }
+        conn.execute(
+            """
+            UPDATE proposals
+            SET title = :title,
+                content = :content,
+                proposal_type = :proposal_type,
+                status = :status,
+                source_run_id = :source_run_id,
+                source_memory_id = :source_memory_id,
+                source_audit_state = :source_audit_state,
+                source_context_summary = :source_context_summary,
+                updated_at = :updated_at
+            WHERE id = :id
+            """,
+            item,
+        )
+        refreshed_row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        refreshed = normalize_proposal_row(refreshed_row, conn)
+        if existing.get('status') != refreshed.get('status'):
+            task_event_create(conn, existing.get('source_task_id') or '', 'proposal_status_updated', f"Proposal status updated: {refreshed.get('title') or 'Proposal'} → {str(refreshed.get('status') or '').replace('_', ' ').title()}.", note=refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'from_status': existing.get('status') or '', 'to_status': refreshed.get('status') or ''})
+        elif existing.get('content') != refreshed.get('content') or existing.get('title') != refreshed.get('title') or existing.get('proposal_type') != refreshed.get('proposal_type'):
+            task_event_create(conn, existing.get('source_task_id') or '', 'proposal_updated', f"Proposal updated: {refreshed.get('title') or 'Proposal'}.", note=refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'proposal_type': refreshed.get('proposal_type') or '', 'status': refreshed.get('status') or ''})
+        conn.commit()
+        return {'proposal': refreshed}
 
 
 def vault_record_create(payload: dict | None = None) -> dict:
@@ -1899,13 +2230,18 @@ def task_get(task_id: str):
         runs = task_runs_list(conn, task_id)
         latest_run = runs[0] if runs else None
         linked_memories = task_memories_list(conn, task_id)
+        linked_proposals = task_proposals_list(conn, task_id)
         task['runs'] = runs
         task['latest_run'] = latest_run
         task['linked_memories'] = linked_memories
         task['linkedMemories'] = linked_memories
         task['memory_count'] = len(linked_memories)
         task['memoryCount'] = len(linked_memories)
-        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories)}
+        task['linked_proposals'] = linked_proposals
+        task['linkedProposals'] = linked_proposals
+        task['proposal_count'] = len(linked_proposals)
+        task['proposalCount'] = len(linked_proposals)
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals)}
 
 
 def task_history_get(task_id: str):
@@ -2213,8 +2549,10 @@ def task_delete(task_id: str):
             attachment_rows = conn.execute('SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC', (task_id,)).fetchall()
             attachment_count = len(attachment_rows)
             child_rows = conn.execute('SELECT id, title, delegation_note FROM tasks WHERE COALESCE(parent_task_id, "") = ?', (task_id,)).fetchall()
+            proposal_count = conn.execute('SELECT COUNT(*) FROM proposals WHERE source_task_id = ?', (task_id,)).fetchone()[0]
             delete_task_attachment_rows(conn, attachment_rows)
             conn.execute('DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?', (task_id, task_id))
+            conn.execute('DELETE FROM proposals WHERE source_task_id = ?', (task_id,))
             for child in child_rows:
                 conn.execute('UPDATE tasks SET parent_task_id = "", updated_at = ? WHERE id = ?', (utc_now(), child['id']))
                 task_event_create(conn, child['id'], 'delegation_unlinked', f"Parent task removed: {existing_row.get('title') or 'Parent task'}.", note=str(child['delegation_note'] or ''), metadata={'parent_task_id': task_id})
@@ -2225,12 +2563,12 @@ def task_delete(task_id: str):
                 run["id"],
                 "success",
                 summary=f"Task \"{existing_row.get('title') or 'Untitled task'}\" removed from the board.",
-                run_detail=f"Deleted the task row, detached {dependency_links} related dependency link(s), unlinked {len(child_rows)} delegated child task(s), and removed {attachment_count} attachment(s).",
+                run_detail=f"Deleted the task row, detached {dependency_links} related dependency link(s), unlinked {len(child_rows)} delegated child task(s), removed {attachment_count} attachment(s), and cleared {proposal_count} linked proposal(s).",
                 result_label="Deleted",
-                log_preview=f"Deleted {existing_row.get('title') or 'Untitled task'} · detached dependency links · removed {attachment_count} attachment(s).",
+                log_preview=f"Deleted {existing_row.get('title') or 'Untitled task'} · detached dependency links · removed {attachment_count} attachment(s) · cleared {proposal_count} proposal(s).",
                 trigger_label="Manual board action",
-                changed_fields=['Deleted', 'Dependencies', 'Attachments'],
-                metadata={**run_context_metadata(task_id=task_id, task_title=existing_row.get('title',''), agent_id=existing_row.get('agent_id',''), deployment_id=initial_ctx.get('deployment_id',''), deployment_target=initial_ctx.get('deployment_target_snapshot',''), deployment_type=initial_ctx.get('deployment_type_snapshot','')), 'dependency_links_removed': dependency_links, 'attachment_count_removed': attachment_count},
+                changed_fields=['Deleted', 'Dependencies', 'Attachments', 'Proposals'],
+                metadata={**run_context_metadata(task_id=task_id, task_title=existing_row.get('title',''), agent_id=existing_row.get('agent_id',''), deployment_id=initial_ctx.get('deployment_id',''), deployment_target=initial_ctx.get('deployment_target_snapshot',''), deployment_type=initial_ctx.get('deployment_type_snapshot','')), 'dependency_links_removed': dependency_links, 'attachment_count_removed': attachment_count, 'proposal_count_removed': proposal_count},
                 title=base_title,
                 **initial_ctx,
             )
@@ -6062,9 +6400,11 @@ class Handler(BaseHTTPRequestHandler):
         task_history_match = re.fullmatch(r"/api/tasks/([^/]+)/history", parsed.path)
         task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
         task_memories_match = re.fullmatch(r"/api/tasks/([^/]+)/memories", parsed.path)
+        task_proposals_match = re.fullmatch(r"/api/tasks/([^/]+)/proposals", parsed.path)
         task_children_match = re.fullmatch(r"/api/tasks/([^/]+)/children", parsed.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
         vault_match = re.fullmatch(r"/api/vault/([^/]+)", parsed.path)
+        proposal_match = re.fullmatch(r"/api/proposals/([^/]+)", parsed.path)
         task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         task_attachment_content_match = re.fullmatch(r"/api/task-attachments/([^/]+)/content", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
@@ -6080,6 +6420,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/vault":
             qs = parse_qs(parsed.query)
             self.send_json(vault_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0]))
+            return
+        if parsed.path == "/api/proposals":
+            qs = parse_qs(parsed.query)
+            self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0]))
             return
         if task_history_match:
             try:
@@ -6098,6 +6442,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(task_memories_get(task_memories_match.group(1)))
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='task_memories_failed', fallback_code='task_memories_failed')
+            return
+        if task_proposals_match:
+            try:
+                self.send_json(task_proposals_get(task_proposals_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='task_proposals_failed', fallback_code='task_proposals_failed')
             return
         if task_children_match:
             try:
@@ -6183,6 +6533,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='vault_detail_failed', fallback_code='vault_detail_failed')
             return
+        if proposal_match:
+            try:
+                self.send_json(proposal_record_get(proposal_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='proposal_detail_failed', fallback_code='proposal_detail_failed')
+            return
         if parsed.path == "/api/library":
             self.send_json(library_list())
             return
@@ -6242,6 +6598,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/vault":
                 self.send_json(vault_record_create(payload), 201)
+                return
+            if parsed.path == "/api/proposals":
+                self.send_json(proposal_record_create(payload), 201)
                 return
             if parsed.path == "/api/tasks/update":
                 task_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
@@ -6326,7 +6685,8 @@ class Handler(BaseHTTPRequestHandler):
         task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
         run_match = re.fullmatch(r"/api/runs/([^/]+)", parsed.path)
-        if not task_match and not task_attachment_match and not deployment_match and not run_match:
+        proposal_match = re.fullmatch(r"/api/proposals/([^/]+)", parsed.path)
+        if not task_match and not task_attachment_match and not deployment_match and not run_match and not proposal_match:
             self.send_error(404, "not found")
             return
         try:
@@ -6336,6 +6696,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if run_match:
                 self.send_json(update_task_execution_run(run_match.group(1), payload))
+                return
+            if proposal_match:
+                self.send_json(proposal_record_update(proposal_match.group(1), payload))
                 return
             self.send_json({"deployment": deployment_update(deployment_match.group(1), payload)})
         except Exception as exc:

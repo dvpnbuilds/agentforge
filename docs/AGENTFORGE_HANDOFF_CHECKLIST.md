@@ -27,6 +27,7 @@ Minimum verification:
 - API smoke for the new behavior
 - browser QA on `http://127.0.0.1:50000`
 - verify updated code is actually serving live
+- if the phase used smoke/temp artifacts, clean them up and confirm they no longer appear in DB/API/UI results before closeout
 
 ### 4) Update canon immediately
 Update:
@@ -51,12 +52,14 @@ Required git flow:
 - commit SHA
 - commit message
 - push result
+- branch
 - changed files
 - backups created
 - what shipped
 - routes / fields changed
 - what was verified
 - runtime status
+- cleanup result
 - intentionally deferred items
 - next recommended phase
 
