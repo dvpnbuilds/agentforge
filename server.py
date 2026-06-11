@@ -1072,6 +1072,8 @@ def init_board():
               audit_state TEXT DEFAULT '',
               audit_note TEXT DEFAULT '',
               audit_updated_at TEXT DEFAULT '',
+              parent_task_id TEXT DEFAULT '',
+              delegation_note TEXT DEFAULT '',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
@@ -1244,6 +1246,8 @@ def init_board():
             'audit_state': "TEXT DEFAULT ''",
             'audit_note': "TEXT DEFAULT ''",
             'audit_updated_at': "TEXT DEFAULT ''",
+            'parent_task_id': "TEXT DEFAULT ''",
+            'delegation_note': "TEXT DEFAULT ''",
             'updated_at': "TEXT DEFAULT ''",
         }
         for column, ddl in task_column_defaults.items():
@@ -1421,6 +1425,53 @@ def task_dependency_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [str(row['depends_on_task_id']) for row in rows if row['depends_on_task_id']]
 
 
+def task_parent_summary(conn: sqlite3.Connection, parent_task_id: str) -> dict | None:
+    parent_id = str(parent_task_id or '').strip()
+    if not parent_id:
+        return None
+    row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (parent_id,)).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    return {
+        'id': str(item.get('id') or ''),
+        'title': str(item.get('title') or ''),
+        'status': normalize_task_status(item.get('status') or 'backlog'),
+        'agent_id': str(item.get('agent_id') or ''),
+        'assignee_id': str(item.get('agent_id') or ''),
+        'assigned_agent_name': str(item.get('assigned_agent_name') or ''),
+        'assignee_name': str(item.get('assigned_agent_name') or ''),
+        'updated_at': str(item.get('updated_at') or ''),
+    }
+
+
+def task_child_summaries(conn: sqlite3.Connection, parent_task_id: str) -> list[dict]:
+    parent_id = str(parent_task_id or '').strip()
+    if not parent_id:
+        return []
+    rows = conn.execute(
+        TASK_SELECT + " WHERE COALESCE(t.parent_task_id, '') = ? ORDER BY CASE t.status WHEN 'ready' THEN 0 WHEN 'triage' THEN 1 WHEN 'backlog' THEN 2 WHEN 'in_progress' THEN 3 WHEN 'review' THEN 4 WHEN 'revision_requested' THEN 5 WHEN 'blocked' THEN 6 WHEN 'completed' THEN 7 ELSE 8 END, t.updated_at DESC, t.created_at DESC",
+        (parent_id,),
+    ).fetchall()
+    return [
+        {
+            'id': str(dict(row).get('id') or ''),
+            'title': str(dict(row).get('title') or ''),
+            'status': normalize_task_status(dict(row).get('status') or 'backlog'),
+            'agent_id': str(dict(row).get('agent_id') or ''),
+            'assignee_id': str(dict(row).get('agent_id') or ''),
+            'assigned_agent_name': str(dict(row).get('assigned_agent_name') or ''),
+            'assignee_name': str(dict(row).get('assigned_agent_name') or ''),
+            'playbook_id': str(dict(row).get('playbook_id') or ''),
+            'playbook_name': str(dict(row).get('linked_playbook_name') or ''),
+            'linked_playbook_name': str(dict(row).get('linked_playbook_name') or ''),
+            'updated_at': str(dict(row).get('updated_at') or ''),
+            'created_at': str(dict(row).get('created_at') or ''),
+        }
+        for row in rows
+    ]
+
+
 def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     if row is None:
         return None
@@ -1439,6 +1490,8 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['audit_state'] = normalize_audit_state(item.get('audit_state') or '')
     item['audit_note'] = str(item.get('audit_note') or '')
     item['audit_updated_at'] = str(item.get('audit_updated_at') or '')
+    item['parent_task_id'] = str(item.get('parent_task_id') or '')
+    item['delegation_note'] = str(item.get('delegation_note') or '')
     item['assigned_agent_name'] = str(item.get('assigned_agent_name') or '')
     item['linked_playbook_name'] = str(item.get('linked_playbook_name') or '')
     item['instruction'] = item['description']
@@ -1451,6 +1504,8 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['auditState'] = item['audit_state']
     item['auditNote'] = item['audit_note']
     item['auditUpdatedAt'] = item['audit_updated_at']
+    item['parentTaskId'] = item['parent_task_id']
+    item['delegationNote'] = item['delegation_note']
     item['createdAt'] = str(item.get('created_at') or '')
     item['updatedAt'] = str(item.get('updated_at') or '')
     item['created_at'] = str(item.get('created_at') or '')
@@ -1473,8 +1528,15 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
             (item['id'],),
         ).fetchall()
     ]
+    parent_task = task_parent_summary(conn, item['parent_task_id'])
+    child_tasks = task_child_summaries(conn, item['id'])
+    item['parent_task'] = parent_task
+    item['parentTask'] = parent_task
+    item['child_tasks'] = child_tasks
+    item['childTasks'] = child_tasks
+    item['child_count'] = len(child_tasks)
+    item['childCount'] = len(child_tasks)
     return item
-
 
 def task_history_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
     rows = conn.execute(
@@ -1545,6 +1607,8 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
     result_text = str(payload.get('result_text', payload.get('result', source.get('result_text', ''))) or '').strip()
     last_note = str(payload.get('last_note', payload.get('lastNote', source.get('last_note', ''))) or '').strip()
     audit_note = str(payload.get('audit_note', payload.get('auditNote', source.get('audit_note', ''))) or '').strip()
+    parent_task_id = str(payload.get('parent_task_id', payload.get('parentTaskId', source.get('parent_task_id', ''))) or '').strip()
+    delegation_note = str(payload.get('delegation_note', payload.get('delegate_note', payload.get('delegationNote', payload.get('delegateNote', source.get('delegation_note', ''))))) or '').strip()
     explicit_audit_state = payload.get('audit_state', payload.get('auditState', None))
     audit_state = normalize_audit_state(explicit_audit_state if explicit_audit_state is not None else source.get('audit_state', ''))
     now = utc_now()
@@ -1565,6 +1629,12 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
         raise ValueError('agent_id does not match an existing agent')
     if playbook_id and not task_exists(conn, 'playbooks', playbook_id):
         raise ValueError('playbook_id does not match an existing playbook')
+    if parent_task_id:
+        parent_row = conn.execute('SELECT id FROM tasks WHERE id = ?', (parent_task_id,)).fetchone()
+        if parent_row is None:
+            raise ValueError('parent_task_id does not match an existing task')
+        if parent_task_id == task_id:
+            raise ValueError('task cannot delegate to itself')
     if dependency_ids:
         placeholders = ','.join(['?'] * len(dependency_ids))
         found = {
@@ -1600,6 +1670,8 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
         'audit_state': audit_state,
         'audit_note': audit_note,
         'audit_updated_at': audit_updated_at,
+        'parent_task_id': parent_task_id,
+        'delegation_note': delegation_note,
         'created_at': source.get('created_at') or now,
         'updated_at': now,
     }
@@ -1648,6 +1720,18 @@ def task_runs_get(task_id: str):
         return {'runs': runs, 'latest_run': runs[0] if runs else None}
 
 
+def task_children_get(task_id: str):
+    if not task_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError('task not found')
+        parent = normalize_task_row(row, conn)
+        children = parent.get('child_tasks') or []
+        return {'task_id': task_id, 'task_title': parent.get('title') or '', 'children': children, 'child_count': len(children)}
+
+
 def sync_task_dependencies(conn: sqlite3.Connection, task_id: str, dependency_ids: list[str]):
     conn.execute('DELETE FROM task_dependencies WHERE task_id = ?', (task_id,))
     for dep_id in dependency_ids:
@@ -1681,9 +1765,9 @@ def task_create(payload: dict):
             conn.execute(
                 """
                 INSERT INTO tasks (
-                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, result_text, last_note, audit_state, audit_note, audit_updated_at, created_at, updated_at
+                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, result_text, last_note, audit_state, audit_note, audit_updated_at, parent_task_id, delegation_note, created_at, updated_at
                 ) VALUES (
-                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :result_text, :last_note, :audit_state, :audit_note, :audit_updated_at, :created_at, :updated_at
+                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :result_text, :last_note, :audit_state, :audit_note, :audit_updated_at, :parent_task_id, :delegation_note, :created_at, :updated_at
                 )
                 """,
                 task,
@@ -1693,6 +1777,10 @@ def task_create(payload: dict):
             row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task['id'],)).fetchone()
             record = normalize_task_row(row, conn)
             task_event_create(conn, record['id'], 'created', f"Task created in {str(record['status']).replace('_', ' ').title()}.", note=record.get('last_note', ''), metadata={'status': record.get('status',''), 'agent_id': record.get('agent_id',''), 'playbook_id': record.get('playbook_id',''), 'result_text': record.get('result_text','')}, created_at=record.get('created_at') or utc_now())
+            if record.get('parent_task_id'):
+                parent_title = record.get('parent_task', {}).get('title') or 'Parent task'
+                task_event_create(conn, record['id'], 'delegated_from_parent', f"Delegated from parent task: {parent_title}.", note=record.get('delegation_note', ''), metadata={'parent_task_id': record.get('parent_task_id', '')}, created_at=record.get('created_at') or utc_now())
+                task_event_create(conn, record['parent_task_id'], 'delegation_child_created', f"Delegated child created: {record['title']}.", note=record.get('delegation_note', ''), metadata={'child_task_id': record['id'], 'child_status': record.get('status', ''), 'child_assignee_id': record.get('agent_id', '')}, created_at=record.get('created_at') or utc_now())
             if record.get('audit_state') == 'pending_review':
                 task_event_create(conn, record['id'], 'audit_requested', 'Task entered audit review.', note=record.get('audit_note', ''), metadata={'audit_state': record.get('audit_state', '')}, created_at=record.get('audit_updated_at') or record.get('updated_at') or utc_now())
             final_ctx = run_context_for_task(conn, task_id=record['id'], task=record)
@@ -1778,6 +1866,8 @@ def task_update(task_id: str, payload: dict):
                     audit_state = :audit_state,
                     audit_note = :audit_note,
                     audit_updated_at = :audit_updated_at,
+                    parent_task_id = :parent_task_id,
+                    delegation_note = :delegation_note,
                     updated_at = :updated_at
                 WHERE id = :id
                 """,
@@ -1807,6 +1897,22 @@ def task_update(task_id: str, payload: dict):
                 task_event_create(conn, record['id'], 'note_saved', 'Operator note updated.', note=record.get('last_note', ''))
             if explicit_thread_note:
                 task_event_create(conn, record['id'], 'thread_comment', 'Task thread note added.', note=explicit_thread_note, metadata={'kind': 'thread_comment'})
+            previous_parent_task_id = str(existing_record.get('parent_task_id') or '')
+            current_parent_task_id = str(record.get('parent_task_id') or '')
+            previous_delegation_note = str(existing_record.get('delegation_note') or '')
+            current_delegation_note = str(record.get('delegation_note') or '')
+            if previous_parent_task_id != current_parent_task_id:
+                previous_parent = existing_record.get('parent_task') or task_parent_summary(conn, previous_parent_task_id) or {}
+                current_parent = record.get('parent_task') or task_parent_summary(conn, current_parent_task_id) or {}
+                if current_parent_task_id:
+                    task_event_create(conn, record['id'], 'delegated_from_parent', f"Parent task linked: {current_parent.get('title') or 'Parent task'}.", note=current_delegation_note, metadata={'parent_task_id': current_parent_task_id})
+                    task_event_create(conn, current_parent_task_id, 'delegation_child_created', f"Delegated child linked: {record['title']}.", note=current_delegation_note, metadata={'child_task_id': record['id'], 'child_status': record.get('status', ''), 'child_assignee_id': record.get('agent_id', '')})
+                elif previous_parent_task_id:
+                    task_event_create(conn, record['id'], 'delegation_unlinked', f"Parent task removed: {previous_parent.get('title') or 'Parent task'}.", note=previous_delegation_note, metadata={'parent_task_id': previous_parent_task_id})
+                    task_event_create(conn, previous_parent_task_id, 'delegation_child_unlinked', f"Delegated child unlinked: {record['title']}.", note=previous_delegation_note, metadata={'child_task_id': record['id']})
+            elif current_parent_task_id and previous_delegation_note != current_delegation_note and current_delegation_note:
+                task_event_create(conn, record['id'], 'delegation_note_saved', 'Delegation note updated.', note=current_delegation_note, metadata={'parent_task_id': current_parent_task_id})
+                task_event_create(conn, current_parent_task_id, 'delegation_note_saved', f"Delegation note updated for child: {record['title']}.", note=current_delegation_note, metadata={'child_task_id': record['id']})
             previous_audit_state = normalize_audit_state(existing_record.get('audit_state') or '')
             current_audit_state = normalize_audit_state(record.get('audit_state') or '')
             previous_audit_note = str(existing_record.get('audit_note') or '')
@@ -1899,8 +2005,12 @@ def task_delete(task_id: str):
             dependency_links = conn.execute('SELECT COUNT(*) FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?', (task_id, task_id)).fetchone()[0]
             attachment_rows = conn.execute('SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC', (task_id,)).fetchall()
             attachment_count = len(attachment_rows)
+            child_rows = conn.execute('SELECT id, title, delegation_note FROM tasks WHERE COALESCE(parent_task_id, "") = ?', (task_id,)).fetchall()
             delete_task_attachment_rows(conn, attachment_rows)
             conn.execute('DELETE FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?', (task_id, task_id))
+            for child in child_rows:
+                conn.execute('UPDATE tasks SET parent_task_id = "", updated_at = ? WHERE id = ?', (utc_now(), child['id']))
+                task_event_create(conn, child['id'], 'delegation_unlinked', f"Parent task removed: {existing_row.get('title') or 'Parent task'}.", note=str(child['delegation_note'] or ''), metadata={'parent_task_id': task_id})
             conn.execute('DELETE FROM task_events WHERE task_id = ?', (task_id,))
             cur = conn.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
             complete_run_record(
@@ -1908,7 +2018,7 @@ def task_delete(task_id: str):
                 run["id"],
                 "success",
                 summary=f"Task \"{existing_row.get('title') or 'Untitled task'}\" removed from the board.",
-                run_detail=f"Deleted the task row, detached {dependency_links} related dependency link(s), and removed {attachment_count} attachment(s).",
+                run_detail=f"Deleted the task row, detached {dependency_links} related dependency link(s), unlinked {len(child_rows)} delegated child task(s), and removed {attachment_count} attachment(s).",
                 result_label="Deleted",
                 log_preview=f"Deleted {existing_row.get('title') or 'Untitled task'} · detached dependency links · removed {attachment_count} attachment(s).",
                 trigger_label="Manual board action",
@@ -5744,6 +5854,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         task_history_match = re.fullmatch(r"/api/tasks/([^/]+)/history", parsed.path)
         task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
+        task_children_match = re.fullmatch(r"/api/tasks/([^/]+)/children", parsed.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
         task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         task_attachment_content_match = re.fullmatch(r"/api/task-attachments/([^/]+)/content", parsed.path)
@@ -5768,6 +5879,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(task_runs_get(task_runs_match.group(1)))
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='task_runs_failed', fallback_code='task_runs_failed')
+            return
+        if task_children_match:
+            try:
+                self.send_json(task_children_get(task_children_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='task_children_failed', fallback_code='task_children_failed')
             return
         if task_match:
             try:

@@ -244,6 +244,46 @@ Next recommended phase:
 - Implementation Phase 11 — Delegation V1
 - tasks now support execution and audit; next highest-leverage loop is parent/child task routing and manual delegation
 
+### Implementation Phase 11 — Delegation V1
+Status: confirmed complete
+Date: 2026-06-11
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+
+What shipped:
+- Delegation tab added inside the shared task workspace
+- tasks now support additive parent/child linkage through the same task record model
+- operator can create a linked child task from the parent workspace with title, instruction, assignee, playbook, queue/status, and delegation note
+- parent tasks show linked child task count and child status rows
+- child tasks show parent task reference in the same workspace
+- delegated child rows are clickable and reopen the child inside the same shared workspace
+
+Routes / data changes:
+- additive task fields: `parent_task_id`, `delegation_note`
+- existing task create/update/detail payloads now surface: `parent_task`, `child_tasks`, `child_count`
+- additive child lookup route: `GET /api/tasks/:id/children`
+- existing task write paths extended: `POST /api/tasks`, `PUT /api/tasks/:id`, and `POST /api/tasks/update?id=...`
+- delegation history events added: `delegated_from_parent`, `delegation_child_created`, `delegation_unlinked`, `delegation_child_unlinked`, `delegation_note_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for parent create, child create, `parent_task_id` round-trip, `GET /api/tasks/:id/children`, parent/child detail linkage, status update, and history events
+- manual browser QA from Tasks and Kanban with live delegated child creation, parent child-count refresh, child open from linked-child row, and shared workspace sync
+- live runtime confirmed on `http://127.0.0.1:50000`
+
+Deferred:
+- nested delegation tree UI beyond one-level linked child visibility
+- automated delegation logic, queue workers, or child run orchestration
+- dependency graphs, child roll-up analytics, or permissions
+
+Next recommended phase:
+- Implementation Phase 12 — Memory Vault V1
+- delegation is now real enough; the next highest-leverage layer is durable knowledge capture tied to tasks, runs, and operator review
+
 ---
 
 ## 6) Where AgentForge is right now
@@ -260,10 +300,11 @@ What feels strongest now:
 - run inspector depth
 - task workspace foundation
 - task-level audit workflow
+- manual parent/child delegation inside the task workspace
 
 What is still clearly missing from the canon product:
 - full Agents overhaul
-- Delegation / subtask tree
+- deeper Delegation / subtask tree
 - deeper Audit beyond V1
 - Memory Vault
 - Proposals system
@@ -277,21 +318,20 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 11 — Delegation V1**
+**Implementation Phase 12 — Memory Vault V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, and audit
-- the next missing operator loop is routing work across parent/child tasks and specialist ownership
-- Delegation is now the highest-leverage missing product behavior before Vault/Proposals
+- tasks now have creation, execution linkage, workspace, audit, and manual delegation
+- the next missing layer is durable context capture so task/run/audit outcomes do not disappear into transient history
+- Memory Vault becomes the highest-leverage next layer before proposals/adaptation
 
-Delegation V1 should likely add:
-- parent task -> child task linkage
-- manual delegate action from the same task workspace
-- assignee handoff visibility
-- linked-child progress visibility from the task context
+Memory Vault V1 should likely add:
+- additive vault records tied to tasks/runs
+- lightweight capture/search flow from the same operator surfaces
+- reusable context snippets that survive beyond a single task timeline
 
 Alternative after that:
-- Memory Vault V1
+- deeper Delegation V2 or Proposals groundwork
 
 ---
 
