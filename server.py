@@ -41,6 +41,8 @@ TASK_ATTACHMENT_ALLOWED_MIME_TYPES = {"application/pdf", "application/json", "ap
 TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
 TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
+AUDIT_STATES = ["pending_review", "approved", "rejected", "revision_requested"]
+AUDIT_STATE_ALIASES = {"pending review": "pending_review", "pending-review": "pending_review", "approve": "approved", "approved": "approved", "reject": "rejected", "rejected": "rejected", "revision requested": "revision_requested", "revision-requested": "revision_requested", "request_revision": "revision_requested", "request revision": "revision_requested"}
 DEPLOYMENT_TYPES = ["hermes_profile", "local_worker", "vps_worker", "webhook", "external"]
 DEPLOYMENT_TRIGGER_MODES = ["manual", "task_driven", "schedule", "webhook"]
 DEPLOYMENT_STATUSES = ["draft", "ready", "inactive"]
@@ -1067,6 +1069,9 @@ def init_board():
               notes TEXT DEFAULT '',
               result_text TEXT DEFAULT '',
               last_note TEXT DEFAULT '',
+              audit_state TEXT DEFAULT '',
+              audit_note TEXT DEFAULT '',
+              audit_updated_at TEXT DEFAULT '',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
@@ -1236,6 +1241,9 @@ def init_board():
             'notes': "TEXT DEFAULT ''",
             'result_text': "TEXT DEFAULT ''",
             'last_note': "TEXT DEFAULT ''",
+            'audit_state': "TEXT DEFAULT ''",
+            'audit_note': "TEXT DEFAULT ''",
+            'audit_updated_at': "TEXT DEFAULT ''",
             'updated_at': "TEXT DEFAULT ''",
         }
         for column, ddl in task_column_defaults.items():
@@ -1379,6 +1387,14 @@ def normalize_task_priority(value) -> str:
     return priority
 
 
+def normalize_audit_state(value) -> str:
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    state = AUDIT_STATE_ALIASES.get(raw, raw)
+    return state if state in AUDIT_STATES else ''
+
+
 def parse_task_dependency_ids(value) -> list[str]:
     ids = []
     seen = set()
@@ -1420,6 +1436,9 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['notes'] = str(item.get('notes') or '')
     item['result_text'] = str(item.get('result_text') or '')
     item['last_note'] = str(item.get('last_note') or '')
+    item['audit_state'] = normalize_audit_state(item.get('audit_state') or '')
+    item['audit_note'] = str(item.get('audit_note') or '')
+    item['audit_updated_at'] = str(item.get('audit_updated_at') or '')
     item['assigned_agent_name'] = str(item.get('assigned_agent_name') or '')
     item['linked_playbook_name'] = str(item.get('linked_playbook_name') or '')
     item['instruction'] = item['description']
@@ -1429,6 +1448,9 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['playbookName'] = item['linked_playbook_name']
     item['result'] = item['result_text']
     item['lastNote'] = item['last_note']
+    item['auditState'] = item['audit_state']
+    item['auditNote'] = item['audit_note']
+    item['auditUpdatedAt'] = item['audit_updated_at']
     item['createdAt'] = str(item.get('created_at') or '')
     item['updatedAt'] = str(item.get('updated_at') or '')
     item['created_at'] = str(item.get('created_at') or '')
@@ -1522,6 +1544,16 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
     playbook_id = str(payload.get('playbook_id', payload.get('playbookId', source.get('playbook_id', ''))) or '').strip()
     result_text = str(payload.get('result_text', payload.get('result', source.get('result_text', ''))) or '').strip()
     last_note = str(payload.get('last_note', payload.get('lastNote', source.get('last_note', ''))) or '').strip()
+    audit_note = str(payload.get('audit_note', payload.get('auditNote', source.get('audit_note', ''))) or '').strip()
+    explicit_audit_state = payload.get('audit_state', payload.get('auditState', None))
+    audit_state = normalize_audit_state(explicit_audit_state if explicit_audit_state is not None else source.get('audit_state', ''))
+    now = utc_now()
+    audit_updated_at = str(source.get('audit_updated_at') or '')
+    if status == 'review' and explicit_audit_state is None and not audit_state:
+        audit_state = 'pending_review'
+        audit_updated_at = now
+    if explicit_audit_state is not None or audit_note != str(source.get('audit_note', '') or '').strip():
+        audit_updated_at = now
     if status == 'ready' and not agent_id:
         raise ValueError('Run Now requires assignee')
     dependency_ids = parse_task_dependency_ids(payload.get('dependency_ids', payload.get('dependencies', [])))
@@ -1553,7 +1585,6 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
                 raise ValueError('attachment_draft_token is required for staged attachments')
             if owner_draft_token != attachment_draft_token:
                 raise ValueError(f"attachment draft token mismatch: {row.get('filename') or row.get('id')}")
-    now = utc_now()
     item = {
         'id': task_id,
         'title': title,
@@ -1566,6 +1597,9 @@ def task_record_from_payload(payload: dict, conn: sqlite3.Connection, existing: 
         'notes': str(payload.get('notes', source.get('notes', '')) or '').strip(),
         'result_text': result_text,
         'last_note': last_note,
+        'audit_state': audit_state,
+        'audit_note': audit_note,
+        'audit_updated_at': audit_updated_at,
         'created_at': source.get('created_at') or now,
         'updated_at': now,
     }
@@ -1647,9 +1681,9 @@ def task_create(payload: dict):
             conn.execute(
                 """
                 INSERT INTO tasks (
-                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, result_text, last_note, created_at, updated_at
+                    id, title, description, status, priority, agent_id, playbook_id, blocked_reason, notes, result_text, last_note, audit_state, audit_note, audit_updated_at, created_at, updated_at
                 ) VALUES (
-                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :result_text, :last_note, :created_at, :updated_at
+                    :id, :title, :description, :status, :priority, :agent_id, :playbook_id, :blocked_reason, :notes, :result_text, :last_note, :audit_state, :audit_note, :audit_updated_at, :created_at, :updated_at
                 )
                 """,
                 task,
@@ -1659,6 +1693,8 @@ def task_create(payload: dict):
             row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task['id'],)).fetchone()
             record = normalize_task_row(row, conn)
             task_event_create(conn, record['id'], 'created', f"Task created in {str(record['status']).replace('_', ' ').title()}.", note=record.get('last_note', ''), metadata={'status': record.get('status',''), 'agent_id': record.get('agent_id',''), 'playbook_id': record.get('playbook_id',''), 'result_text': record.get('result_text','')}, created_at=record.get('created_at') or utc_now())
+            if record.get('audit_state') == 'pending_review':
+                task_event_create(conn, record['id'], 'audit_requested', 'Task entered audit review.', note=record.get('audit_note', ''), metadata={'audit_state': record.get('audit_state', '')}, created_at=record.get('audit_updated_at') or record.get('updated_at') or utc_now())
             final_ctx = run_context_for_task(conn, task_id=record['id'], task=record)
             status_label = str(record['status']).replace('_', ' ').title()
             complete_run_record(
@@ -1704,6 +1740,9 @@ def task_update(task_id: str, payload: dict):
             raise KeyError('task not found')
         existing_row = dict(existing)
         existing_record = normalize_task_row(existing, conn)
+        explicit_thread_note = str((payload or {}).get('thread_note', (payload or {}).get('threadNote', (payload or {}).get('comment', ''))) or '').strip()
+        explicit_audit_note = str((payload or {}).get('audit_note', (payload or {}).get('auditNote', '')) or '').strip()
+        explicit_audit_state = (payload or {}).get('audit_state', (payload or {}).get('auditState', None))
         base_title = trim_run_text(f"Update task: {existing_row.get('title') or 'Untitled task'}", 140)
         initial_ctx = run_context_for_task(conn, task_id=task_id, task=existing_row)
         run = create_run_record(
@@ -1736,6 +1775,9 @@ def task_update(task_id: str, payload: dict):
                     notes = :notes,
                     result_text = :result_text,
                     last_note = :last_note,
+                    audit_state = :audit_state,
+                    audit_note = :audit_note,
+                    audit_updated_at = :audit_updated_at,
                     updated_at = :updated_at
                 WHERE id = :id
                 """,
@@ -1761,8 +1803,28 @@ def task_update(task_id: str, payload: dict):
                 task_event_create(conn, record['id'], 'instruction_updated', 'Instruction updated.', metadata={'previous_length': len(str(existing_record.get('description') or '')), 'current_length': len(str(record.get('description') or ''))})
             if str(existing_record.get('result_text') or '') != str(record.get('result_text') or ''):
                 task_event_create(conn, record['id'], 'result_saved', 'Result/output updated.', note=record.get('result_text', ''), metadata={'has_result': bool(str(record.get('result_text') or '').strip())})
-            if record.get('last_note') and str(existing_record.get('last_note') or '') != str(record.get('last_note') or '') and previous_status == current_status:
+            if record.get('last_note') and str(existing_record.get('last_note') or '') != str(record.get('last_note') or '') and previous_status == current_status and not explicit_thread_note:
                 task_event_create(conn, record['id'], 'note_saved', 'Operator note updated.', note=record.get('last_note', ''))
+            if explicit_thread_note:
+                task_event_create(conn, record['id'], 'thread_comment', 'Task thread note added.', note=explicit_thread_note, metadata={'kind': 'thread_comment'})
+            previous_audit_state = normalize_audit_state(existing_record.get('audit_state') or '')
+            current_audit_state = normalize_audit_state(record.get('audit_state') or '')
+            previous_audit_note = str(existing_record.get('audit_note') or '')
+            current_audit_note = str(record.get('audit_note') or '')
+            if previous_audit_state != current_audit_state:
+                audit_event_map = {
+                    'pending_review': ('audit_requested', 'Task entered audit review.', current_audit_note, {'audit_state': current_audit_state}),
+                    'approved': ('audit_approved', 'Task approved during audit.', current_audit_note, {'audit_state': current_audit_state}),
+                    'rejected': ('audit_rejected', 'Task rejected during audit.', current_audit_note, {'audit_state': current_audit_state}),
+                    'revision_requested': ('revision_requested', 'Revision requested during audit.', current_audit_note, {'audit_state': current_audit_state}),
+                }
+                if current_audit_state in audit_event_map:
+                    event_type, message, note, metadata = audit_event_map[current_audit_state]
+                    task_event_create(conn, record['id'], event_type, message, note=note, metadata=metadata)
+            if explicit_audit_note and previous_audit_note != current_audit_note:
+                task_event_create(conn, record['id'], 'audit_note_saved', 'Audit note saved.', note=current_audit_note, metadata={'audit_state': current_audit_state or previous_audit_state})
+            elif explicit_audit_state is not None and previous_audit_note != current_audit_note and current_audit_note:
+                task_event_create(conn, record['id'], 'audit_note_saved', 'Audit note saved.', note=current_audit_note, metadata={'audit_state': current_audit_state})
             final_ctx = run_context_for_task(conn, task_id=record['id'], task=record)
             status_label = str(record['status']).replace('_', ' ').title()
             changed_fields = run_changed_fields_for_keys(existing_row, record, [('title', 'Title'), ('status', 'Status'), ('priority', 'Priority'), ('agent_id', 'Assigned Agent'), ('playbook_id', 'Playbook'), ('blocked_reason', 'Blocked Reason'), ('notes', 'Notes'), ('description', 'Description')])
@@ -5835,6 +5897,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/tasks":
                 self.send_json({"task": task_create(payload)}, 201)
+                return
+            if parsed.path == "/api/tasks/update":
+                task_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
+                self.send_json({"task": task_update(task_id, payload)})
                 return
             if parsed.path == "/api/playbooks":
                 self.send_json({"playbook": playbook_create(payload)}, 201)
