@@ -284,13 +284,53 @@ Next recommended phase:
 - Implementation Phase 12 — Memory Vault V1
 - delegation is now real enough; the next highest-leverage layer is durable knowledge capture tied to tasks, runs, and operator review
 
+### Implementation Phase 12 — Memory Vault V1
+Status: confirmed complete
+Date: 2026-06-11
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/docs/AGENTFORGE_HANDOFF_CHECKLIST.md`
+
+What shipped:
+- Memory tab added inside the shared task workspace so operators can save durable vault records without leaving the task flow
+- vault records now preserve title, content, source task linkage, optional source run linkage, memory type, created-by label, and timestamps
+- task detail now surfaces linked memory records plus memory count alongside existing run/audit/delegation data
+- linked memories can be reopened and read inside the same workspace, including linked-run context when present
+- a simple vault list/search API now exists for practical retrieval outside the task detail payload
+
+Routes / data changes:
+- new table: `vault_records`
+- additive task detail/list fields: `memory_count`, `linked_memories`
+- new routes: `POST /api/vault`, `GET /api/vault`, `GET /api/vault/:id`, `GET /api/tasks/:id/memories`
+- new vault fields: `id`, `title`, `content`, `source_task_id`, `source_run_id`, `memory_type`, `created_by`, `created_at`, `updated_at`
+- task history event added: `memory_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for task create, run start/complete, thread/output/audit updates, child delegation, vault create/list/detail/search, and task-linked memory count round-trip
+- manual browser QA from Tasks and Kanban with shared workspace open, Memory tab visible, linked record readback, and live save-to-vault from the workspace
+- live runtime confirmed on `http://127.0.0.1:50000` with updated `server.py` process bound to port `50000`
+
+Deferred:
+- embeddings/vector retrieval or autonomous summarization
+- proposal coupling, approval-governed learning, permissions, or attachments on vault records
+- standalone vault analytics/dashboard expansion beyond practical V1 retrieval
+
+Next recommended phase:
+- Implementation Phase 13 — Proposals V1
+- now that tasks can retain durable outputs and lessons, the next highest-value layer is turning that preserved context into explicit operator-visible improvement proposals
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is now reportedly in place through Phase 9 handoff**
+- **task workspace is real and now includes execution, audit, delegation, and memory capture in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -301,15 +341,16 @@ What feels strongest now:
 - task workspace foundation
 - task-level audit workflow
 - manual parent/child delegation inside the task workspace
+- task-linked memory capture and retrieval
 
 What is still clearly missing from the canon product:
 - full Agents overhaul
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
-- Memory Vault
 - Proposals system
 - Approval-governed adaptation layer
 - deeper task workspace richness beyond V1
+- richer vault intelligence beyond operator-curated V1 capture
 
 ---
 
@@ -318,20 +359,20 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 12 — Memory Vault V1**
+**Implementation Phase 13 — Proposals V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, and manual delegation
-- the next missing layer is durable context capture so task/run/audit outcomes do not disappear into transient history
-- Memory Vault becomes the highest-leverage next layer before proposals/adaptation
+- tasks now have creation, execution linkage, workspace, audit, delegation, and durable memory capture
+- the highest-value remaining gap is turning preserved task/run/memory context into explicit operator-visible improvement proposals
+- Proposals V1 fits naturally after Memory Vault because it can reuse linked outputs, lessons, and audit history instead of inventing context from scratch
 
-Memory Vault V1 should likely add:
-- additive vault records tied to tasks/runs
-- lightweight capture/search flow from the same operator surfaces
-- reusable context snippets that survive beyond a single task timeline
+Proposals V1 should likely add:
+- additive proposal records tied to tasks, runs, and optionally vault memories
+- clear operator-visible suggestion cards with approve/reject states
+- proposal generation focused on workflow improvements, next actions, or system refinements without mutating structure automatically
 
 Alternative after that:
-- deeper Delegation V2 or Proposals groundwork
+- deeper Delegation V2 or approval-governed adaptation groundwork
 
 ---
 
@@ -397,13 +438,15 @@ Current reality:
 - Tasks + Kanban are real
 - Runs/history are strong
 - Task Workspace V1 is real
-- Audit V1 is now real
+- Audit V1 is real
+- Delegation V1 is now real
+- Memory Vault V1 is now real
 
 Main missing product layers:
-- Delegation
-- Vault
 - Proposals
 - approval-governed adaptation
+- deeper delegation/orchestration depth
+- richer memory intelligence beyond curated V1 capture
 
-Current best next step after Phase 10:
-- **Implementation Phase 11 — Delegation V1**
+Current best next step after Phase 12:
+- **Implementation Phase 13 — Proposals V1**

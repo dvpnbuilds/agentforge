@@ -36,6 +36,7 @@ Must update these sections:
 - `Current implementation sequence`
 - `Where AgentForge is right now`
 - `Recommended next build direction`
+- `Short canonical summary`
 
 Add the new phase entry using the canon template.
 

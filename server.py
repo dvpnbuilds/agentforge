@@ -38,6 +38,7 @@ TASK_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 TASK_ATTACHMENT_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".rtf", ".odt"}
 TASK_ATTACHMENT_ALLOWED_MIME_PREFIXES = ("image/", "text/")
 TASK_ATTACHMENT_ALLOWED_MIME_TYPES = {"application/pdf", "application/json", "application/msword", "application/rtf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.oasis.opendocument.text"}
+VAULT_MEMORY_TYPES = ["note", "lesson", "decision", "output", "prompt", "research", "system"]
 TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
 TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
@@ -1118,6 +1119,22 @@ def init_board():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id, created_at, id)")
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS vault_records (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              source_task_id TEXT NOT NULL,
+              source_run_id TEXT DEFAULT '',
+              memory_type TEXT DEFAULT '',
+              created_by TEXT DEFAULT 'operator',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_records_task_id ON vault_records(source_task_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_records_run_id ON vault_records(source_run_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_records_type ON vault_records(memory_type, updated_at DESC, created_at DESC)")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS playbooks (
               id TEXT PRIMARY KEY,
               slug TEXT NOT NULL UNIQUE,
@@ -1399,6 +1416,11 @@ def normalize_audit_state(value) -> str:
     return state if state in AUDIT_STATES else ''
 
 
+def normalize_vault_memory_type(value) -> str:
+    raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
+    return raw if raw in VAULT_MEMORY_TYPES else ''
+
+
 def parse_task_dependency_ids(value) -> list[str]:
     ids = []
     seen = set()
@@ -1536,7 +1558,187 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['childTasks'] = child_tasks
     item['child_count'] = len(child_tasks)
     item['childCount'] = len(child_tasks)
+    item['memory_count'] = task_memory_count(conn, item['id'])
+    item['memoryCount'] = item['memory_count']
     return item
+
+
+def normalize_vault_record_row(row, conn: sqlite3.Connection | None = None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    item['id'] = str(item.get('id') or '')
+    item['title'] = str(item.get('title') or '')
+    item['content'] = str(item.get('content') or '')
+    item['source_task_id'] = str(item.get('source_task_id') or '')
+    item['source_run_id'] = str(item.get('source_run_id') or '')
+    item['memory_type'] = normalize_vault_memory_type(item.get('memory_type') or '')
+    item['created_by'] = str(item.get('created_by') or 'operator')
+    item['created_at'] = str(item.get('created_at') or '')
+    item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
+    item['sourceTaskId'] = item['source_task_id']
+    item['sourceRunId'] = item['source_run_id']
+    item['memoryType'] = item['memory_type']
+    item['createdBy'] = item['created_by']
+    item['createdAt'] = item['created_at']
+    item['updatedAt'] = item['updated_at']
+    item['source_task'] = None
+    item['source_run'] = None
+    if conn is not None and item['source_task_id']:
+        item['source_task'] = task_parent_summary(conn, item['source_task_id'])
+    if conn is not None and item['source_run_id']:
+        run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (item['source_run_id'],)).fetchone()
+        if run_row is not None:
+            run = normalize_run_row(run_row)
+            item['source_run'] = {
+                'id': str(run.get('id') or ''),
+                'status': str(run.get('display_status') or run.get('status') or ''),
+                'title': str(run.get('title') or ''),
+                'summary': str(run.get('summary') or ''),
+                'task_id': str(run.get('linked_task_id') or run.get('task_id') or ''),
+                'task_title_snapshot': str(run.get('linked_task_title_snapshot') or run.get('task_title_snapshot') or ''),
+                'updated_at': str(run.get('updated_at') or run.get('finished_at') or run.get('started_at') or run.get('created_at') or ''),
+            }
+    return item
+
+
+def task_memory_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM vault_records WHERE source_task_id = ?", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def task_memories_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    if not task_id:
+        return []
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM vault_records
+        WHERE source_task_id = ?
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        """,
+        (task_id,),
+    ).fetchall()
+    return [normalize_vault_record_row(row, conn) for row in rows if row is not None]
+
+
+def task_memories_get(task_id: str):
+    if not task_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError('task not found')
+        task = normalize_task_row(row, conn)
+        memories = task_memories_list(conn, task_id)
+        return {'task_id': task_id, 'task_title': task.get('title') or '', 'memories': memories, 'memory_count': len(memories)}
+
+
+def vault_record_get(vault_id: str):
+    if not vault_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM vault_records WHERE id = ?", (vault_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('vault_record', vault_id)
+        return {'memory': normalize_vault_record_row(row, conn)}
+
+
+def vault_records_list(query: str = '', task_id: str = '', run_id: str = '') -> dict:
+    with connect_board() as conn:
+        where = []
+        params: list[str] = []
+        clean_query = str(query or '').strip()
+        clean_task_id = str(task_id or '').strip()
+        clean_run_id = str(run_id or '').strip()
+        if clean_task_id:
+            where.append("source_task_id = ?")
+            params.append(clean_task_id)
+        if clean_run_id:
+            where.append("source_run_id = ?")
+            params.append(clean_run_id)
+        if clean_query:
+            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(memory_type) LIKE ?)")
+            needle = f"%{clean_query.lower()}%"
+            params.extend([needle, needle, needle])
+        sql = "SELECT * FROM vault_records"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC, created_at DESC, id DESC"
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        memories = [normalize_vault_record_row(row, conn) for row in rows if row is not None]
+        return {'memories': memories, 'count': len(memories), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id}
+
+
+def vault_record_create(payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    title = str(payload.get('title') or '').strip()
+    content = str(payload.get('content', payload.get('note', '')) or '').strip()
+    source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
+    source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', payload.get('runId', '')))) or '').strip()
+    memory_type = normalize_vault_memory_type(payload.get('memory_type', payload.get('category', payload.get('memoryType', payload.get('type', '')))))
+    created_by = str(payload.get('created_by', payload.get('operator', payload.get('createdBy', 'operator'))) or 'operator').strip() or 'operator'
+    if not title:
+        raise ValueError('title is required')
+    if not content:
+        raise ValueError('content is required')
+    if not source_task_id:
+        raise ValueError('source_task_id is required')
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (source_task_id,)).fetchone()
+        if task_row is None:
+            raise ValueError('source_task_id does not match an existing task')
+        task = normalize_task_row(task_row, conn)
+        run = None
+        if source_run_id:
+            run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (source_run_id,)).fetchone()
+            if run_row is None:
+                raise ValueError('source_run_id does not match an existing run')
+            run = normalize_run_row(run_row)
+            linked_task_id = str(run.get('linked_task_id') or run.get('task_id') or '')
+            if linked_task_id and linked_task_id != source_task_id:
+                raise ValueError('source_run_id is linked to a different task')
+        now = utc_now()
+        item = {
+            'id': uuid.uuid4().hex,
+            'title': title,
+            'content': content,
+            'source_task_id': source_task_id,
+            'source_run_id': source_run_id,
+            'memory_type': memory_type,
+            'created_by': created_by,
+            'created_at': now,
+            'updated_at': now,
+        }
+        conn.execute(
+            """
+            INSERT INTO vault_records (
+              id, title, content, source_task_id, source_run_id, memory_type, created_by, created_at, updated_at
+            ) VALUES (
+              :id, :title, :content, :source_task_id, :source_run_id, :memory_type, :created_by, :created_at, :updated_at
+            )
+            """,
+            item,
+        )
+        task_event_create(
+            conn,
+            source_task_id,
+            'memory_saved',
+            f"Vault memory saved: {title}.",
+            note=content,
+            metadata={
+                'memory_id': item['id'],
+                'memory_type': memory_type,
+                'source_run_id': source_run_id,
+                'created_by': created_by,
+            },
+        )
+        conn.commit()
+        memory = normalize_vault_record_row(item, conn)
+        return {'memory': memory, 'task': task, 'source_run': run}
+
 
 def task_history_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
     rows = conn.execute(
@@ -1696,9 +1898,14 @@ def task_get(task_id: str):
         task = normalize_task_row(row, conn)
         runs = task_runs_list(conn, task_id)
         latest_run = runs[0] if runs else None
+        linked_memories = task_memories_list(conn, task_id)
         task['runs'] = runs
         task['latest_run'] = latest_run
-        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run}
+        task['linked_memories'] = linked_memories
+        task['linkedMemories'] = linked_memories
+        task['memory_count'] = len(linked_memories)
+        task['memoryCount'] = len(linked_memories)
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories)}
 
 
 def task_history_get(task_id: str):
@@ -5854,8 +6061,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         task_history_match = re.fullmatch(r"/api/tasks/([^/]+)/history", parsed.path)
         task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
+        task_memories_match = re.fullmatch(r"/api/tasks/([^/]+)/memories", parsed.path)
         task_children_match = re.fullmatch(r"/api/tasks/([^/]+)/children", parsed.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+        vault_match = re.fullmatch(r"/api/vault/([^/]+)", parsed.path)
         task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         task_attachment_content_match = re.fullmatch(r"/api/task-attachments/([^/]+)/content", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
@@ -5868,6 +6077,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tasks":
             self.send_json({"tasks": task_list()})
             return
+        if parsed.path == "/api/vault":
+            qs = parse_qs(parsed.query)
+            self.send_json(vault_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0]))
+            return
         if task_history_match:
             try:
                 self.send_json(task_history_get(task_history_match.group(1)))
@@ -5879,6 +6092,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(task_runs_get(task_runs_match.group(1)))
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='task_runs_failed', fallback_code='task_runs_failed')
+            return
+        if task_memories_match:
+            try:
+                self.send_json(task_memories_get(task_memories_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='task_memories_failed', fallback_code='task_memories_failed')
             return
         if task_children_match:
             try:
@@ -5958,6 +6177,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='run_detail_failed', fallback_code='run_detail_failed')
             return
+        if vault_match:
+            try:
+                self.send_json(vault_record_get(vault_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='vault_detail_failed', fallback_code='vault_detail_failed')
+            return
         if parsed.path == "/api/library":
             self.send_json(library_list())
             return
@@ -6014,6 +6239,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/tasks":
                 self.send_json({"task": task_create(payload)}, 201)
+                return
+            if parsed.path == "/api/vault":
+                self.send_json(vault_record_create(payload), 201)
                 return
             if parsed.path == "/api/tasks/update":
                 task_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
