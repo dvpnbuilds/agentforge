@@ -654,8 +654,6 @@
       const state=useKanbanData();
       const tasks=state.tasks||[];
       const [viewMode,setViewMode]=useState('list');
-      const boardSectionRef=useRef(null);
-      useEffect(()=>{if(viewMode!=='board')return;const el=boardSectionRef.current;if(!el)return;el.scrollIntoView({block:'start',behavior:'smooth'});},[viewMode]);
       const total=tasks.length;
       const assigned=tasks.filter(task=>task.agent_id).length;
       const reviewLoop=tasks.filter(task=>['review','revision_requested'].includes(task.status)).length;
@@ -677,26 +675,36 @@
               h('button',{onClick:()=>state.setCreateOpen(true),className:'rounded-2xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-[0_16px_40px_rgba(15,23,42,.18)] transition hover:-translate-y-px'},'New Task')
             )
           ),
-          h('div',{className:'mt-4 grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_repeat(4,minmax(0,150px))]'},
-            h('div',{className:'rounded-[22px] border border-white/50 bg-white/80 px-4 py-4 shadow-sm'},
-              h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},'WORKSPACE STATE'),
-              h('div',{className:'mt-2 flex flex-wrap items-center gap-2'},
-                h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50 px-3 py-1 text-[11px] font-semibold text-cyan-700'},viewMode==='list'?'List view active':'Board view active'),
-                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},selectedTaskLabel)
+          viewMode==='board'
+            ? h('div',{className:'mt-4 flex flex-wrap items-center gap-2 rounded-[22px] border border-white/50 bg-white/78 px-4 py-3 shadow-sm'},
+                h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50 px-3 py-1 text-[11px] font-semibold text-cyan-700'},'Board view active'),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},selectedTaskLabel),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},`${num(total)} total`),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},`${num(assigned)} assigned`),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},`${num(reviewLoop)} review`),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},`${num(completed)} done`),
+                h('span',{className:'text-xs text-slate-500'},'Board keeps the same task workspace on the right.')
+              )
+            : h('div',{className:'mt-4 grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_repeat(4,minmax(0,150px))]'},
+                h('div',{className:'rounded-[22px] border border-white/50 bg-white/80 px-4 py-4 shadow-sm'},
+                  h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},'WORKSPACE STATE'),
+                  h('div',{className:'mt-2 flex flex-wrap items-center gap-2'},
+                    h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50 px-3 py-1 text-[11px] font-semibold text-cyan-700'},'List view active'),
+                    h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},selectedTaskLabel)
+                  ),
+                  h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},'Use the list for tighter scan order. Open any row to reuse the same workspace on the right.'),
+                ),
+                h(TaskSummaryCard,{label:'Total',value:total,color:'#22D3EE'}),
+                h(TaskSummaryCard,{label:'Assigned',value:assigned,color:'#8B5CF6'}),
+                h(TaskSummaryCard,{label:'Review',value:reviewLoop,color:'#EC4899'}),
+                h(TaskSummaryCard,{label:'Done',value:completed,color:'#10B981'})
               ),
-              h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},viewMode==='list'?'Use the list for tighter scan order. Open any row to reuse the same workspace on the right.':'Use the board for queue-stage triage. Opening a card lands in the same workspace on the right.'),
-            ),
-            h(TaskSummaryCard,{label:'Total',value:total,color:'#22D3EE'}),
-            h(TaskSummaryCard,{label:'Assigned',value:assigned,color:'#8B5CF6'}),
-            h(TaskSummaryCard,{label:'Review',value:reviewLoop,color:'#EC4899'}),
-            h(TaskSummaryCard,{label:'Done',value:completed,color:'#10B981'})
-          ),
           state.toast&&h('div',{className:'mt-4 rounded-2xl border border-cyan-100 bg-cyan-50/80 px-4 py-3 text-sm text-cyan-700'},state.toast),
           state.loading&&h('div',{className:'mt-3 text-xs text-slate-400'},'Syncing tasks…')
         ),
         state.createOpen&&h(TaskCreatePanel,{agents:state.agents,playbooks:state.playbooks,onCancel:()=>state.setCreateOpen(false),onSubmit:payload=>state.createTask(payload)}),
         h('section',{className:'grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start'},
-          h('section',{ref:viewMode==='board'?boardSectionRef:null,className:'rounded-[28px] border border-white/40 bg-white/65 p-5 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
+          h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-5 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
             h('div',{className:'mb-4 flex flex-wrap items-start justify-between gap-3'},
               h('div',{className:'max-w-2xl'},
                 h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},viewMode==='list'?'TASK LIST':'STATUS BOARD'),
