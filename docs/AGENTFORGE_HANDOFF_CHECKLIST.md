@@ -28,6 +28,7 @@ Minimum verification:
 - browser QA on `http://127.0.0.1:50000`
 - verify updated code is actually serving live
 - if the phase used smoke/temp artifacts, clean them up and confirm they no longer appear in DB/API/UI results before closeout
+- if the phase adds approval/governance workflow, verify the full state path and its history events, not just field writes
 
 ### 4) Update canon immediately
 Update:

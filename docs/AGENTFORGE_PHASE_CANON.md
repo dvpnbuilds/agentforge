@@ -1,6 +1,6 @@
 # AgentForge Phase Canon
 
-Last updated: 2026-06-11
+Last updated: 2026-06-12
 Purpose: continuity anchor for AgentForge whenever chat context drifts, compression fails, or DEV/PLANNING/AUDIT need one trusted source.
 
 ---
@@ -368,13 +368,56 @@ Next recommended phase:
 - Implementation Phase 14 — Approval-Governed Adaptation V1
 - proposals are now explicit and reviewable; the next highest-value layer is turning accepted proposals into safe, human-approved structural adaptation instead of passive suggestion storage
 
+### Implementation Phase 14 — Approval-Governed Adaptation V1
+Status: confirmed complete
+Date: 2026-06-12
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/docs/AGENTFORGE_HANDOFF_CHECKLIST.md`
+
+What shipped:
+- proposal records now carry explicit approval-governed adaptation state inside the same shared task workspace instead of stopping at passive proposal status
+- operators can save approval reasoning, request approval, approve, reject, and apply proposals without leaving the task detail flow
+- task detail now surfaces proposal governance counts so pending approvals and approved/applied proposals are visible at the task level
+- proposal workflow actions append readable governance history events so approval decisions stay auditable from the same task record
+- proposal detail now shows approval timestamps, applied timestamps, reviewer identity, adaptation type, and preserved task/run/memory/audit linkage context
+
+Routes / data changes:
+- extended proposal fields: `approval_state`, `approval_note`, `approval_updated_at`, `applied_at`, `reviewed_by`, `adaptation_type`
+- extended list route: `GET /api/proposals` now supports `approval_state`
+- extended write route: `POST /api/proposals` now accepts approval/adaptation metadata with guardrails
+- extended update route: `PUT /api/proposals/:id` now accepts approval/adaptation metadata with lifecycle validation
+- new proposal workflow routes: `POST /api/proposals/:id/request-approval`, `POST /api/proposals/:id/approve`, `POST /api/proposals/:id/reject`, `POST /api/proposals/:id/apply`
+- additive task fields: `pending_approval_count`, `approved_proposal_count`, `pendingApprovalCount`, `approvedProposalCount`
+- task history events added: `proposal_sent_for_approval`, `proposal_approved`, `proposal_rejected`, `proposal_applied`, `approval_note_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for proposal acceptance, approval request, approval decision, apply path, task counters, and preserved task/memory/audit linkage
+- browser QA from the live task workspace with proposal governance controls visible: linked proposals, approval pending badge, save approval note, approve/reject/apply actions
+- cleanup sweep removed temporary Phase 14 verification artifacts and confirmed no lingering `P14_VERIFY_*` or `P14_BROWSER_QA*` records in DB cleanup checks
+- live runtime confirmed on `http://127.0.0.1:50000` with startup proof from the active `server.py` process
+
+Deferred:
+- automatic structural mutation from approved proposals
+- rollback execution engine for applied adaptations
+- proposal queue analytics, batching, or multi-approver policy layers
+
+Next recommended phase:
+- Implementation Phase 15 — Applied Adaptation Execution V1
+- approval-governed decisions are now explicit; the next highest-value layer is executing approved adaptations through a controlled, observable apply path instead of status-only governance
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, memory capture, and proposals in one shared flow**
+- **task workspace is real and now includes execution, audit, delegation, memory capture, proposals, and approval-governed adaptation in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -387,12 +430,13 @@ What feels strongest now:
 - manual parent/child delegation inside the task workspace
 - task-linked memory capture and retrieval
 - task-linked proposal capture and lifecycle updates
+- approval-governed proposal review and application controls
 
 What is still clearly missing from the canon product:
 - full Agents overhaul
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
-- Approval-governed adaptation layer
+- applied adaptation execution beyond governance state
 - deeper task workspace richness beyond V1
 - richer vault intelligence beyond operator-curated V1 capture
 - proposal automation beyond operator-driven V1 capture
@@ -404,17 +448,17 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 14 — Approval-Governed Adaptation V1**
+**Implementation Phase 15 — Applied Adaptation Execution V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, and explicit proposal records
-- the highest-value remaining gap is deciding how accepted proposals can safely change behavior without allowing silent structural drift
-- Approval-Governed Adaptation V1 fits naturally after Proposals because it can use accepted proposal records as the explicit approval gate for controlled system change
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, explicit proposal records, and operator-governed approval state
+- the highest-value remaining gap is turning approved adaptations into controlled applied outcomes instead of only recording governance decisions
+- Applied Adaptation Execution V1 fits naturally next because approval-safe intent is now explicit and can gate the first real execution pathway
 
-Approval-Governed Adaptation V1 should likely add:
-- explicit approval flow that only promotes accepted proposals into change candidates
-- a governed adaptation record tying proposal -> approval decision -> applied outcome
-- operator-visible safeguards so accepted ideas still require deliberate execution, logging, and rollback-aware state changes
+Applied Adaptation Execution V1 should likely add:
+- explicit execution records or outcome logs for applied proposal actions
+- controlled apply workflows that translate approved proposals into visible task/system changes with operator checkpoints
+- rollback-aware or reversible execution metadata so applied adaptations do not become opaque state flips
 
 Alternative after that:
 - deeper Delegation V2 or richer proposal generation/analytics
@@ -487,12 +531,13 @@ Current reality:
 - Delegation V1 is now real
 - Memory Vault V1 is now real
 - Proposals V1 is now real
+- Approval-Governed Adaptation V1 is now real
 
 Main missing product layers:
-- approval-governed adaptation
+- applied adaptation execution beyond governance state
 - deeper delegation/orchestration depth
 - richer memory intelligence beyond curated V1 capture
 - richer proposal automation beyond operator-driven V1
 
-Current best next step after Phase 13:
-- **Implementation Phase 14 — Approval-Governed Adaptation V1**
+Current best next step after Phase 14:
+- **Implementation Phase 15 — Applied Adaptation Execution V1**

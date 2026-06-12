@@ -41,6 +41,24 @@ TASK_ATTACHMENT_ALLOWED_MIME_TYPES = {"application/pdf", "application/json", "ap
 VAULT_MEMORY_TYPES = ["note", "lesson", "decision", "output", "prompt", "research", "system"]
 PROPOSAL_TYPES = ["workflow", "quality", "audit", "delegation", "memory", "prompt", "automation", "other"]
 PROPOSAL_STATUSES = ["proposed", "accepted", "rejected", "applied"]
+APPROVAL_STATES = ["not_requested", "approval_pending", "approved", "rejected", "applied"]
+APPROVAL_STATE_ALIASES = {
+    "pending": "approval_pending",
+    "pending_review": "approval_pending",
+    "approval pending": "approval_pending",
+    "approval-pending": "approval_pending",
+    "requested": "approval_pending",
+    "request_approval": "approval_pending",
+    "approve": "approved",
+    "approved": "approved",
+    "reject": "rejected",
+    "rejected": "rejected",
+    "apply": "applied",
+    "applied": "applied",
+    "none": "not_requested",
+    "not_requested": "not_requested",
+    "not requested": "not_requested",
+}
 TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
 TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
@@ -1143,6 +1161,12 @@ def init_board():
               content TEXT NOT NULL,
               proposal_type TEXT DEFAULT '',
               status TEXT NOT NULL DEFAULT 'proposed',
+              approval_state TEXT DEFAULT 'not_requested',
+              approval_note TEXT DEFAULT '',
+              approval_updated_at TEXT DEFAULT '',
+              applied_at TEXT DEFAULT '',
+              reviewed_by TEXT DEFAULT 'operator',
+              adaptation_type TEXT DEFAULT '',
               source_task_id TEXT NOT NULL,
               source_run_id TEXT DEFAULT '',
               source_memory_id TEXT DEFAULT '',
@@ -1368,6 +1392,24 @@ def init_board():
         backfill_run_semantics(conn)
         conn.execute("UPDATE agents SET deployment_status = COALESCE(NULLIF(deployment_status,''), 'not_deployed')")
 
+        proposal_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
+        proposal_column_defaults = {
+            'approval_state': "TEXT DEFAULT 'not_requested'",
+            'approval_note': "TEXT DEFAULT ''",
+            'approval_updated_at': "TEXT DEFAULT ''",
+            'applied_at': "TEXT DEFAULT ''",
+            'reviewed_by': "TEXT DEFAULT 'operator'",
+            'adaptation_type': "TEXT DEFAULT ''",
+        }
+        for column, ddl in proposal_column_defaults.items():
+            if column not in proposal_columns:
+                conn.execute(f"ALTER TABLE proposals ADD COLUMN {column} {ddl}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_approval_state ON proposals(approval_state, updated_at DESC, created_at DESC)")
+        conn.execute("UPDATE proposals SET approval_state = 'applied' WHERE COALESCE(NULLIF(applied_at,''), '') <> ''")
+        conn.execute("UPDATE proposals SET approval_state = 'applied', applied_at = COALESCE(NULLIF(applied_at,''), updated_at, created_at, ?) WHERE lower(COALESCE(status,'')) = 'applied'", (utc_now(),))
+        conn.execute("UPDATE proposals SET approval_state = 'rejected', approval_updated_at = COALESCE(NULLIF(approval_updated_at,''), updated_at, created_at, ?) WHERE lower(COALESCE(status,'')) = 'rejected' AND lower(COALESCE(approval_state,'')) NOT IN ('applied')", (utc_now(),))
+        conn.execute("UPDATE proposals SET approval_state = 'not_requested' WHERE COALESCE(NULLIF(approval_state,''), '') = ''")
+
         if 'status' in task_columns:
 
             conn.execute("UPDATE tasks SET status = 'backlog' WHERE LOWER(COALESCE(status,'')) = 'pending'")
@@ -1452,6 +1494,14 @@ def normalize_proposal_type(value) -> str:
 def normalize_proposal_status(value) -> str:
     raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
     return raw if raw in PROPOSAL_STATUSES else 'proposed'
+
+
+def normalize_approval_state(value) -> str:
+    raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
+    if not raw:
+        return 'not_requested'
+    state = APPROVAL_STATE_ALIASES.get(raw, raw)
+    return state if state in APPROVAL_STATES else 'not_requested'
 
 
 def parse_task_dependency_ids(value) -> list[str]:
@@ -1595,6 +1645,10 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['memoryCount'] = item['memory_count']
     item['proposal_count'] = task_proposal_count(conn, item['id'])
     item['proposalCount'] = item['proposal_count']
+    item['pending_approval_count'] = task_pending_approval_count(conn, item['id'])
+    item['pendingApprovalCount'] = item['pending_approval_count']
+    item['approved_proposal_count'] = task_approved_proposal_count(conn, item['id'])
+    item['approvedProposalCount'] = item['approved_proposal_count']
     return item
 
 
@@ -1648,6 +1702,20 @@ def task_proposal_count(conn: sqlite3.Connection, task_id: str) -> int:
     if not task_id:
         return 0
     row = conn.execute("SELECT COUNT(*) AS count FROM proposals WHERE source_task_id = ?", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def task_pending_approval_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM proposals WHERE source_task_id = ? AND approval_state = 'approval_pending'", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def task_approved_proposal_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM proposals WHERE source_task_id = ? AND approval_state IN ('approved', 'applied')", (task_id,)).fetchone()
     return int((row['count'] if row else 0) or 0)
 
 
@@ -1723,6 +1791,12 @@ def normalize_proposal_row(row, conn: sqlite3.Connection | None = None) -> dict 
     item['content'] = str(item.get('content') or '')
     item['proposal_type'] = normalize_proposal_type(item.get('proposal_type') or '')
     item['status'] = normalize_proposal_status(item.get('status') or '')
+    item['approval_state'] = normalize_approval_state(item.get('approval_state') or '')
+    item['approval_note'] = str(item.get('approval_note') or '')
+    item['approval_updated_at'] = str(item.get('approval_updated_at') or '')
+    item['applied_at'] = str(item.get('applied_at') or '')
+    item['reviewed_by'] = str(item.get('reviewed_by') or 'operator')
+    item['adaptation_type'] = str(item.get('adaptation_type') or '')
     item['source_task_id'] = str(item.get('source_task_id') or '')
     item['source_run_id'] = str(item.get('source_run_id') or '')
     item['source_memory_id'] = str(item.get('source_memory_id') or '')
@@ -1731,6 +1805,12 @@ def normalize_proposal_row(row, conn: sqlite3.Connection | None = None) -> dict 
     item['created_at'] = str(item.get('created_at') or '')
     item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
     item['proposalType'] = item['proposal_type']
+    item['approvalState'] = item['approval_state']
+    item['approvalNote'] = item['approval_note']
+    item['approvalUpdatedAt'] = item['approval_updated_at']
+    item['appliedAt'] = item['applied_at']
+    item['reviewedBy'] = item['reviewed_by']
+    item['adaptationType'] = item['adaptation_type']
     item['sourceTaskId'] = item['source_task_id']
     item['sourceRunId'] = item['source_run_id']
     item['sourceMemoryId'] = item['source_memory_id']
@@ -1806,7 +1886,7 @@ def proposal_record_get(proposal_id: str):
         return {'proposal': normalize_proposal_row(row, conn)}
 
 
-def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', memory_id: str = '', status: str = '') -> dict:
+def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', memory_id: str = '', status: str = '', approval_state: str = '') -> dict:
     with connect_board() as conn:
         where = []
         params: list[str] = []
@@ -1815,6 +1895,7 @@ def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', 
         clean_run_id = str(run_id or '').strip()
         clean_memory_id = str(memory_id or '').strip()
         clean_status = normalize_proposal_status(status) if str(status or '').strip() else ''
+        clean_approval_state = normalize_approval_state(approval_state) if str(approval_state or '').strip() else ''
         if clean_task_id:
             where.append("source_task_id = ?")
             params.append(clean_task_id)
@@ -1827,25 +1908,33 @@ def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', 
         if clean_status:
             where.append("status = ?")
             params.append(clean_status)
+        if clean_approval_state:
+            where.append("approval_state = ?")
+            params.append(clean_approval_state)
         if clean_query:
-            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(proposal_type) LIKE ? OR lower(source_context_summary) LIKE ?)")
+            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(proposal_type) LIKE ? OR lower(source_context_summary) LIKE ? OR lower(approval_note) LIKE ? OR lower(adaptation_type) LIKE ?)")
             needle = f"%{clean_query.lower()}%"
-            params.extend([needle, needle, needle, needle])
+            params.extend([needle, needle, needle, needle, needle, needle])
         sql = "SELECT * FROM proposals"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY updated_at DESC, created_at DESC, id DESC"
         rows = conn.execute(sql, tuple(params)).fetchall()
         proposals = [normalize_proposal_row(row, conn) for row in rows if row is not None]
-        return {'proposals': proposals, 'count': len(proposals), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id, 'source_memory_id': clean_memory_id, 'status': clean_status}
+        return {'proposals': proposals, 'count': len(proposals), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id, 'source_memory_id': clean_memory_id, 'status': clean_status, 'approval_state': clean_approval_state}
 
 
 def proposal_record_create(payload: dict | None = None) -> dict:
     payload = dict(payload or {})
+    governance_action = bool(payload.get('_governance_action'))
     title = str(payload.get('title') or '').strip()
     content = str(payload.get('content', payload.get('rationale', payload.get('note', ''))) or '').strip()
     proposal_type = normalize_proposal_type(payload.get('proposal_type', payload.get('type', payload.get('proposalType', 'other'))))
     status = normalize_proposal_status(payload.get('status', payload.get('proposal_status', payload.get('proposalStatus', 'proposed'))))
+    approval_state = normalize_approval_state(payload.get('approval_state', payload.get('approvalState', 'not_requested')))
+    approval_note = str(payload.get('approval_note', payload.get('approvalNote', '')) or '').strip()
+    reviewed_by = str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator'
+    adaptation_type = str(payload.get('adaptation_type', payload.get('adaptationType', '')) or '').strip()
     source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
     source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', payload.get('runId', '')))) or '').strip()
     source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', payload.get('memoryId', '')))) or '').strip()
@@ -1885,12 +1974,32 @@ def proposal_record_create(payload: dict | None = None) -> dict:
             summary_bits = [task.get('title') or '', task.get('last_note') or '', task.get('result_text') or '', run.get('summary') if run else '', memory.get('title') if memory else '']
             source_context_summary = trim_run_text(' | '.join(bit.strip() for bit in summary_bits if str(bit or '').strip()), 280)
         now = utc_now()
+        approval_updated_at = now if approval_note or approval_state != 'not_requested' else ''
+        applied_at = now if approval_state == 'applied' or status == 'applied' else ''
+        if status == 'rejected' and not governance_action:
+            raise ValueError('rejection decisions must use the governed proposal workflow route')
+        if approval_state in ('approved', 'rejected', 'applied'):
+            raise ValueError('approval decisions must use the governed proposal workflow routes')
+        if approval_state == 'approval_pending' and not governance_action:
+            raise ValueError('approval requests must use the governed proposal workflow route')
+        if approval_state == 'approval_pending' and status != 'accepted':
+            raise ValueError('proposal must be accepted before approval can be requested')
+        if status == 'applied' and approval_state not in ('approved', 'applied'):
+            raise ValueError('proposal must be approved before it can be applied')
+        if approval_state == 'applied':
+            status = 'applied'
         item = {
             'id': uuid.uuid4().hex,
             'title': title,
             'content': content,
             'proposal_type': proposal_type,
             'status': status,
+            'approval_state': approval_state,
+            'approval_note': approval_note,
+            'approval_updated_at': approval_updated_at,
+            'applied_at': applied_at,
+            'reviewed_by': reviewed_by,
+            'adaptation_type': adaptation_type,
             'source_task_id': source_task_id,
             'source_run_id': source_run_id,
             'source_memory_id': source_memory_id,
@@ -1902,9 +2011,9 @@ def proposal_record_create(payload: dict | None = None) -> dict:
         conn.execute(
             """
             INSERT INTO proposals (
-              id, title, content, proposal_type, status, source_task_id, source_run_id, source_memory_id, source_audit_state, source_context_summary, created_at, updated_at
+              id, title, content, proposal_type, status, approval_state, approval_note, approval_updated_at, applied_at, reviewed_by, adaptation_type, source_task_id, source_run_id, source_memory_id, source_audit_state, source_context_summary, created_at, updated_at
             ) VALUES (
-              :id, :title, :content, :proposal_type, :status, :source_task_id, :source_run_id, :source_memory_id, :source_audit_state, :source_context_summary, :created_at, :updated_at
+              :id, :title, :content, :proposal_type, :status, :approval_state, :approval_note, :approval_updated_at, :applied_at, :reviewed_by, :adaptation_type, :source_task_id, :source_run_id, :source_memory_id, :source_audit_state, :source_context_summary, :created_at, :updated_at
             )
             """,
             item,
@@ -1919,6 +2028,7 @@ def proposal_record_create(payload: dict | None = None) -> dict:
                 'proposal_id': item['id'],
                 'proposal_type': proposal_type,
                 'status': status,
+                'approval_state': approval_state,
                 'source_run_id': source_run_id,
                 'source_memory_id': source_memory_id,
                 'source_audit_state': source_audit_state,
@@ -1938,10 +2048,17 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
         if existing_row is None:
             raise ResourceNotFoundError('proposal', proposal_id)
         existing = normalize_proposal_row(existing_row, conn)
+        if existing is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
         title = str(payload.get('title', existing.get('title') or '') or '').strip()
         content = str(payload.get('content', payload.get('rationale', existing.get('content') or '')) or '').strip()
+        governance_action = bool(payload.get('_governance_action'))
         proposal_type = normalize_proposal_type(payload.get('proposal_type', payload.get('type', payload.get('proposalType', existing.get('proposal_type') or 'other'))))
         status = normalize_proposal_status(payload.get('status', payload.get('proposal_status', payload.get('proposalStatus', existing.get('status') or 'proposed'))))
+        approval_state = normalize_approval_state(payload.get('approval_state', payload.get('approvalState', existing.get('approval_state') or 'not_requested')))
+        approval_note = str(payload.get('approval_note', payload.get('approvalNote', existing.get('approval_note') or '')) or '').strip()
+        reviewed_by = str(payload.get('reviewed_by', payload.get('reviewedBy', existing.get('reviewed_by') or 'operator')) or 'operator').strip() or 'operator'
+        adaptation_type = str(payload.get('adaptation_type', payload.get('adaptationType', existing.get('adaptation_type') or '')) or '').strip()
         source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', existing.get('source_run_id') or ''))) or '').strip()
         source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', existing.get('source_memory_id') or ''))) or '').strip()
         source_audit_state = normalize_audit_state(payload.get('source_audit_state', payload.get('audit_state', payload.get('sourceAuditState', existing.get('source_audit_state') or ''))))
@@ -1965,12 +2082,43 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
             memory = normalize_vault_record_row(memory_row, conn)
             if str(memory.get('source_task_id') or '') != existing.get('source_task_id'):
                 raise ValueError('source_memory_id is linked to a different task')
+        existing_status = normalize_proposal_status(existing.get('status') or 'proposed')
+        existing_approval_state = normalize_approval_state(existing.get('approval_state') or 'not_requested')
+        if not governance_action and approval_state != existing_approval_state and approval_state in ('approval_pending', 'approved', 'rejected', 'applied'):
+            raise ValueError('approval state transitions must use the governed proposal workflow routes')
+        if not governance_action and status == 'rejected' and existing_status != 'rejected':
+            raise ValueError('rejection transitions must use the governed proposal workflow route')
+        if not governance_action and status == 'applied' and existing_status != 'applied':
+            raise ValueError('apply transitions must use the governed proposal workflow route')
+        if existing_approval_state == 'applied' and (approval_state != 'applied' or status != 'applied'):
+            raise ValueError('applied proposals cannot be moved back to an earlier governance state')
+        if approval_state == 'approval_pending' and status != 'accepted':
+            raise ValueError('proposal must be accepted before approval can be requested')
+        if approval_state in ('approved', 'rejected', 'applied') and status not in ('accepted', 'applied'):
+            raise ValueError('proposal must be accepted before approval decisions can be recorded')
+        if status == 'applied' and approval_state not in ('approved', 'applied'):
+            raise ValueError('proposal must be approved before it can be applied')
+        approval_updated_at = existing.get('approval_updated_at') or ''
+        if approval_note != str(existing.get('approval_note') or '') or approval_state != normalize_approval_state(existing.get('approval_state') or '') or reviewed_by != str(existing.get('reviewed_by') or 'operator'):
+            approval_updated_at = utc_now()
+        applied_at = str(existing.get('applied_at') or '')
+        if approval_state == 'applied' or status == 'applied':
+            if not applied_at:
+                applied_at = utc_now()
+            status = 'applied'
+            approval_state = 'applied'
         item = {
             'id': proposal_id,
             'title': title,
             'content': content,
             'proposal_type': proposal_type,
             'status': status,
+            'approval_state': approval_state,
+            'approval_note': approval_note,
+            'approval_updated_at': approval_updated_at,
+            'applied_at': applied_at,
+            'reviewed_by': reviewed_by,
+            'adaptation_type': adaptation_type,
             'source_run_id': source_run_id,
             'source_memory_id': source_memory_id,
             'source_audit_state': source_audit_state,
@@ -1984,6 +2132,12 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
                 content = :content,
                 proposal_type = :proposal_type,
                 status = :status,
+                approval_state = :approval_state,
+                approval_note = :approval_note,
+                approval_updated_at = :approval_updated_at,
+                applied_at = :applied_at,
+                reviewed_by = :reviewed_by,
+                adaptation_type = :adaptation_type,
                 source_run_id = :source_run_id,
                 source_memory_id = :source_memory_id,
                 source_audit_state = :source_audit_state,
@@ -1997,10 +2151,118 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
         refreshed = normalize_proposal_row(refreshed_row, conn)
         if existing.get('status') != refreshed.get('status'):
             task_event_create(conn, existing.get('source_task_id') or '', 'proposal_status_updated', f"Proposal status updated: {refreshed.get('title') or 'Proposal'} → {str(refreshed.get('status') or '').replace('_', ' ').title()}.", note=refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'from_status': existing.get('status') or '', 'to_status': refreshed.get('status') or ''})
-        elif existing.get('content') != refreshed.get('content') or existing.get('title') != refreshed.get('title') or existing.get('proposal_type') != refreshed.get('proposal_type'):
-            task_event_create(conn, existing.get('source_task_id') or '', 'proposal_updated', f"Proposal updated: {refreshed.get('title') or 'Proposal'}.", note=refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'proposal_type': refreshed.get('proposal_type') or '', 'status': refreshed.get('status') or ''})
+        if existing.get('approval_state') != refreshed.get('approval_state'):
+            next_state = refreshed.get('approval_state') or 'not_requested'
+            event_type = {
+                'approval_pending': 'proposal_sent_for_approval',
+                'approved': 'proposal_approved',
+                'rejected': 'proposal_rejected',
+                'applied': 'proposal_applied',
+            }.get(next_state)
+            if event_type:
+                task_event_create(conn, existing.get('source_task_id') or '', event_type, f"Proposal governance updated: {refreshed.get('title') or 'Proposal'} → {next_state.replace('_', ' ').title()}.", note=refreshed.get('approval_note') or refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'from_approval_state': existing.get('approval_state') or 'not_requested', 'to_approval_state': next_state, 'reviewed_by': refreshed.get('reviewed_by') or 'operator', 'adaptation_type': refreshed.get('adaptation_type') or ''})
+        if existing.get('approval_note') != refreshed.get('approval_note'):
+            task_event_create(conn, existing.get('source_task_id') or '', 'approval_note_saved', f"Approval note saved for: {refreshed.get('title') or 'Proposal'}.", note=refreshed.get('approval_note') or '', metadata={'proposal_id': proposal_id, 'approval_state': refreshed.get('approval_state') or 'not_requested', 'reviewed_by': refreshed.get('reviewed_by') or 'operator'})
+        if existing.get('content') != refreshed.get('content') or existing.get('title') != refreshed.get('title') or existing.get('proposal_type') != refreshed.get('proposal_type') or existing.get('adaptation_type') != refreshed.get('adaptation_type'):
+            task_event_create(conn, existing.get('source_task_id') or '', 'proposal_updated', f"Proposal updated: {refreshed.get('title') or 'Proposal'}.", note=refreshed.get('content') or '', metadata={'proposal_id': proposal_id, 'proposal_type': refreshed.get('proposal_type') or '', 'status': refreshed.get('status') or '', 'approval_state': refreshed.get('approval_state') or 'not_requested', 'adaptation_type': refreshed.get('adaptation_type') or ''})
         conn.commit()
         return {'proposal': refreshed}
+
+
+def proposal_request_approval(proposal_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(row, conn)
+        if proposal is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        if proposal.get('status') != 'accepted':
+            raise ValueError('proposal must be accepted before approval can be requested')
+    update_payload = {
+        '_governance_action': True,
+        'status': 'accepted',
+        'approval_state': 'approval_pending',
+        'approval_note': str(payload.get('approval_note', payload.get('note', proposal.get('approval_note') or '')) or '').strip(),
+        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'adaptation_type': str(payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or '')) or '').strip(),
+        'source_task_id': proposal.get('source_task_id') or '',
+    }
+    return proposal_record_update(proposal_id, update_payload)
+
+
+def proposal_approve(proposal_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(row, conn)
+        if proposal is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        if proposal.get('status') != 'accepted':
+            raise ValueError('proposal must be accepted before approval can be granted')
+        if proposal.get('approval_state') not in ('approval_pending', 'approved'):
+            raise ValueError('proposal must be pending approval before it can be approved')
+    update_payload = {
+        '_governance_action': True,
+        'status': 'accepted',
+        'approval_state': 'approved',
+        'approval_note': str(payload.get('approval_note', payload.get('note', proposal.get('approval_note') or '')) or '').strip(),
+        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'adaptation_type': str(payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or '')) or '').strip(),
+        'source_task_id': proposal.get('source_task_id') or '',
+    }
+    return proposal_record_update(proposal_id, update_payload)
+
+
+def proposal_reject(proposal_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(row, conn)
+        if proposal is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        if proposal.get('status') != 'accepted':
+            raise ValueError('proposal must be accepted before rejection can be recorded')
+        if proposal.get('approval_state') not in ('approval_pending', 'rejected'):
+            raise ValueError('proposal must be pending approval before rejection can be recorded')
+    update_payload = {
+        '_governance_action': True,
+        'status': 'accepted',
+        'approval_state': 'rejected',
+        'approval_note': str(payload.get('approval_note', payload.get('note', proposal.get('approval_note') or '')) or '').strip(),
+        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'adaptation_type': str(payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or '')) or '').strip(),
+        'source_task_id': proposal.get('source_task_id') or '',
+    }
+    return proposal_record_update(proposal_id, update_payload)
+
+
+def proposal_apply(proposal_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(row, conn)
+        if proposal is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        if proposal.get('approval_state') not in ('approved', 'applied'):
+            raise ValueError('proposal must be approved before it can be applied')
+    update_payload = {
+        '_governance_action': True,
+        'status': 'applied',
+        'approval_state': 'applied',
+        'approval_note': str(payload.get('approval_note', payload.get('note', proposal.get('approval_note') or '')) or '').strip(),
+        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'adaptation_type': str(payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or '')) or '').strip(),
+        'source_task_id': proposal.get('source_task_id') or '',
+    }
+    return proposal_record_update(proposal_id, update_payload)
 
 
 def vault_record_create(payload: dict | None = None) -> dict:
@@ -6423,7 +6685,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/proposals":
             qs = parse_qs(parsed.query)
-            self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0]))
+            self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0], approval_state=(qs.get('approval_state') or qs.get('approvalState') or [''])[0]))
             return
         if task_history_match:
             try:
@@ -6599,8 +6861,24 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/vault":
                 self.send_json(vault_record_create(payload), 201)
                 return
+            approval_request_match = re.fullmatch(r"/api/proposals/([^/]+)/request-approval", parsed.path)
+            proposal_approve_match = re.fullmatch(r"/api/proposals/([^/]+)/approve", parsed.path)
+            proposal_reject_match = re.fullmatch(r"/api/proposals/([^/]+)/reject", parsed.path)
+            proposal_apply_match = re.fullmatch(r"/api/proposals/([^/]+)/apply", parsed.path)
             if parsed.path == "/api/proposals":
                 self.send_json(proposal_record_create(payload), 201)
+                return
+            if approval_request_match:
+                self.send_json(proposal_request_approval(approval_request_match.group(1), payload))
+                return
+            if proposal_approve_match:
+                self.send_json(proposal_approve(proposal_approve_match.group(1), payload))
+                return
+            if proposal_reject_match:
+                self.send_json(proposal_reject(proposal_reject_match.group(1), payload))
+                return
+            if proposal_apply_match:
+                self.send_json(proposal_apply(proposal_apply_match.group(1), payload))
                 return
             if parsed.path == "/api/tasks/update":
                 task_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
