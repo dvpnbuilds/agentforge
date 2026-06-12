@@ -493,13 +493,54 @@ Next recommended phase:
 - Implementation Phase 17 — Vault Intelligence V1
 - generated proposals now exist, but the biggest quality gap is richer retrieval and synthesis from accumulated vault memory so future suggestions are driven by stronger reusable knowledge instead of only recent task-local context
 
+### Implementation Phase 17 — Task Output Flow V1
+Status: confirmed complete
+Date: 2026-06-12
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+
+What shipped:
+- the shared task workspace Output tab now supports a real task-to-output generation flow instead of output fields behaving like shallow inline notes
+- generated task outputs are now persisted as durable task-linked records with generator metadata, context summary snapshots, saved status, and linked run provenance
+- output generation now creates and completes a real task-linked run so operators can inspect output generation as part of the same task lifecycle instead of losing that execution trace
+- task detail/list payloads now surface saved output linkage consistently enough for the latest output and output count to round-trip through API and live UI state
+- UI-driven output generation now survives reload/reopen through durable saved records instead of transient-only browser state
+
+Routes / data changes:
+- existing task output generation path now completes through a valid task-linked run lifecycle with `run_type='task_run'` and `run_purpose='task_output_generation'`
+- task output records now link `source_run_id` to the actual generation run instead of a nullable/stale latest-run reference
+- output persistence now uses normalized success-state values so task outputs and run completion metadata pass backend validation
+- task run retrieval/listing now includes output-generation runs via `linked_task_id`, allowing `latest_run` and linked run summaries to reflect generated outputs correctly
+- run purpose metadata now includes `task_output_generation` label/badge support for output-generation visibility in task-linked run surfaces
+- task history confirms output lifecycle events through `output_generation_requested`, `output_generated`, `output_saved`, and `result_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for task create, output generate/save, `output_count`, `latest_output`, `result_text`, linked `source_run_id`, completed run status, and output-history events
+- browser QA from the live task workspace with task created from Tasks, Output tab opened, output generated from UI, saved output record rendered, and no browser console errors
+- cleanup sweep removed the temporary browser-QA task and confirmed the live verification flow did not need to leave durable test clutter behind
+- live runtime confirmed on `http://127.0.0.1:50000` with the active `server.py` process serving the updated code path
+
+Deferred:
+- richer output templates/types beyond the current V1 generator flow
+- model-backed output generation/ranking instead of heuristic-only generation
+- output analytics, comparison views, or bulk output workflows
+
+Next recommended phase:
+- Implementation Phase 18 — Vault Intelligence V1
+- durable task outputs now exist as reusable artifacts; the next highest-value gap is stronger retrieval/synthesis across vault memory and saved task artifacts so future proposal/output quality can draw from more than local task context
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, memory capture, manual/generated proposals, approval governance, and applied adaptation execution in one shared flow**
+- **task workspace is real and now includes execution, audit, delegation, memory capture, durable task outputs, manual/generated proposals, approval governance, and applied adaptation execution in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -508,6 +549,7 @@ What feels strongest now:
 - runs/history visibility
 - run inspector depth
 - task workspace foundation
+- durable task output generation and saved output readback
 - task-level audit workflow
 - manual parent/child delegation inside the task workspace
 - task-linked memory capture and retrieval
@@ -520,7 +562,7 @@ What is still clearly missing from the canon product:
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
 - deeper task workspace richness beyond V1
-- richer vault intelligence beyond operator-curated V1 capture
+- richer vault intelligence beyond operator-curated V1 capture and saved task artifact reuse
 - higher-quality proposal synthesis beyond heuristic V1 generation
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
@@ -531,11 +573,11 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 17 — Vault Intelligence V1**
+**Implementation Phase 18 — Vault Intelligence V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, generated/manual proposal records, approval governance, and real applied execution state
-- Proposal Automation V1 reduced manual authoring, but proposal quality is still bounded by shallow task-local heuristics and weak retrieval over accumulated vault knowledge
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, durable saved outputs, generated/manual proposal records, approval governance, and real applied execution state
+- Task Output Flow V1 made task deliverables durable and reusable, but proposal/output quality is still bounded by shallow task-local heuristics and weak retrieval over accumulated vault knowledge
 - Vault Intelligence V1 is the best next layer because it would improve both operator recall and proposal quality without jumping prematurely into autonomous multi-step orchestration
 
 Vault Intelligence V1 should likely add:
@@ -613,16 +655,17 @@ Current reality:
 - Audit V1 is real
 - Delegation V1 is now real
 - Memory Vault V1 is now real
+- Task Output Flow V1 is now real
 - Proposals V1 is now real
 - Approval-Governed Adaptation V1 is now real
 - Applied Adaptation Execution V1 is now real
 - Proposal Automation V1 is now real
 
 Main missing product layers:
-- richer vault intelligence beyond curated V1 capture
+- richer vault intelligence beyond curated V1 capture and saved artifact reuse
 - higher-quality proposal synthesis beyond heuristic V1 generation
 - deeper delegation/orchestration depth
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
-Current best next step after Phase 16:
-- **Implementation Phase 17 — Vault Intelligence V1**
+Current best next step after Phase 17:
+- **Implementation Phase 18 — Vault Intelligence V1**

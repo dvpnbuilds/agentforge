@@ -94,7 +94,7 @@ RUN_STATUS_ALIASES = {"complete": "completed", "completed": "completed", "succee
 RUN_ORIGINS = ["seed", "live"]
 RUN_SOURCES = ["user", "system", "verification", "runtime", "deployment", "task", "unknown"]
 RUN_SOURCE_ALIASES = {"demo": "system", "operator": "user"}
-RUN_PURPOSES = ["execution", "test", "smoke_test", "cleanup", "verification", "retry", "diagnostic", "unknown"]
+RUN_PURPOSES = ["execution", "task_output_generation", "test", "smoke_test", "cleanup", "verification", "retry", "diagnostic", "unknown"]
 RUN_PURPOSE_ALIASES = {"task_lifecycle": "diagnostic", "deployment_lifecycle": "diagnostic", "agent_lifecycle": "diagnostic", "agent_execution": "execution", "evaluation": "execution", "demo_seed": "test", "task_execution": "execution"}
 RUN_TRACE_EVENT_TYPES = ["queued", "planning", "tool_selection", "tool_execution", "result_assembly", "completed", "failed", "step"]
 RUN_TRACE_STATUSES = ["pending", "running", "success", "failed", "skipped"]
@@ -1211,6 +1211,31 @@ def init_board():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, updated_at DESC, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_type ON proposals(proposal_type, updated_at DESC, created_at DESC)")
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_outputs (
+              id TEXT PRIMARY KEY,
+              source_task_id TEXT NOT NULL,
+              source_run_id TEXT DEFAULT '',
+              agent_id TEXT DEFAULT '',
+              agent_name_snapshot TEXT DEFAULT '',
+              playbook_id TEXT DEFAULT '',
+              playbook_name TEXT DEFAULT '',
+              title TEXT NOT NULL,
+              content TEXT NOT NULL,
+              output_type TEXT DEFAULT 'generic',
+              format_hint TEXT DEFAULT '',
+              status TEXT DEFAULT 'generated',
+              generation_source TEXT DEFAULT '',
+              generation_note TEXT DEFAULT '',
+              context_summary TEXT DEFAULT '',
+              created_by TEXT DEFAULT 'operator',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_task_id ON task_outputs(source_task_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_run_id ON task_outputs(source_run_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_type ON task_outputs(output_type, updated_at DESC, created_at DESC)")
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS playbooks (
               id TEXT PRIMARY KEY,
               slug TEXT NOT NULL UNIQUE,
@@ -1754,6 +1779,11 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     latest_adaptation = task_latest_adaptation(conn, item['id'])
     item['latest_adaptation'] = latest_adaptation
     item['latestAdaptation'] = latest_adaptation
+    item['output_count'] = task_output_count(conn, item['id'])
+    item['outputCount'] = item['output_count']
+    latest_output = task_latest_output(conn, item['id'])
+    item['latest_output'] = latest_output
+    item['latestOutput'] = latest_output
     return item
 
 
@@ -1794,6 +1824,147 @@ def normalize_vault_record_row(row, conn: sqlite3.Connection | None = None) -> d
                 'updated_at': str(run.get('updated_at') or run.get('finished_at') or run.get('started_at') or run.get('created_at') or ''),
             }
     return item
+
+
+
+def normalize_task_output_row(row, conn: sqlite3.Connection | None = None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    item['id'] = str(item.get('id') or '')
+    item['source_task_id'] = str(item.get('source_task_id') or '')
+    item['source_run_id'] = str(item.get('source_run_id') or '')
+    item['agent_id'] = str(item.get('agent_id') or '')
+    item['agent_name_snapshot'] = str(item.get('agent_name_snapshot') or '')
+    item['playbook_id'] = str(item.get('playbook_id') or '')
+    item['playbook_name'] = str(item.get('playbook_name') or '')
+    item['title'] = str(item.get('title') or '')
+    item['content'] = str(item.get('content') or '')
+    item['output_type'] = str(item.get('output_type') or 'generic').strip().lower() or 'generic'
+    item['format_hint'] = str(item.get('format_hint') or '')
+    item['status'] = str(item.get('status') or 'generated').strip().lower() or 'generated'
+    item['generation_source'] = str(item.get('generation_source') or '')
+    item['generation_note'] = str(item.get('generation_note') or '')
+    item['context_summary'] = str(item.get('context_summary') or '')
+    item['created_by'] = str(item.get('created_by') or 'operator')
+    item['created_at'] = str(item.get('created_at') or '')
+    item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
+    item['sourceTaskId'] = item['source_task_id']
+    item['sourceRunId'] = item['source_run_id']
+    item['agentId'] = item['agent_id']
+    item['agentNameSnapshot'] = item['agent_name_snapshot']
+    item['playbookId'] = item['playbook_id']
+    item['playbookName'] = item['playbook_name']
+    item['outputType'] = item['output_type']
+    item['formatHint'] = item['format_hint']
+    item['generationSource'] = item['generation_source']
+    item['generationNote'] = item['generation_note']
+    item['contextSummary'] = item['context_summary']
+    item['createdBy'] = item['created_by']
+    item['createdAt'] = item['created_at']
+    item['updatedAt'] = item['updated_at']
+    item['preview'] = trim_run_text(item['content'], 220)
+    item['source_task'] = None
+    item['source_run'] = None
+    if conn is not None and item['source_task_id']:
+        item['source_task'] = task_parent_summary(conn, item['source_task_id'])
+    if conn is not None and item['source_run_id']:
+        run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (item['source_run_id'],)).fetchone()
+        if run_row is not None:
+            run = normalize_run_row(run_row)
+            item['source_run'] = {
+                'id': str(run.get('id') or ''),
+                'status': str(run.get('display_status') or run.get('status') or ''),
+                'title': str(run.get('title') or ''),
+                'summary': str(run.get('summary') or ''),
+                'updated_at': str(run.get('updated_at') or run.get('finished_at') or run.get('started_at') or run.get('created_at') or ''),
+            }
+    return item
+
+
+def task_outputs_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    if not task_id:
+        return []
+    rows = conn.execute(
+        "SELECT * FROM task_outputs WHERE source_task_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    return [normalize_task_output_row(row, conn) for row in rows if row is not None]
+
+
+def task_latest_output(conn: sqlite3.Connection, task_id: str) -> dict | None:
+    if not task_id:
+        return None
+    row = conn.execute(
+        "SELECT * FROM task_outputs WHERE source_task_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return normalize_task_output_row(row, conn)
+
+
+def task_output_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM task_outputs WHERE source_task_id = ?", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def create_task_output_record(conn: sqlite3.Connection, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
+    source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', payload.get('runId', '')))) or '').strip()
+    title = str(payload.get('title') or '').strip()
+    content = str(payload.get('content') or '').strip()
+    if not source_task_id:
+        raise ValueError('source_task_id is required')
+    if not title:
+        raise ValueError('title is required')
+    if not content:
+        raise ValueError('content is required')
+    task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (source_task_id,)).fetchone()
+    if task_row is None:
+        raise ValueError('source_task_id does not match an existing task')
+    task = normalize_task_row(task_row, conn)
+    if source_run_id:
+        run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (source_run_id,)).fetchone()
+        if run_row is None:
+            raise ValueError('source_run_id does not match an existing run')
+        run = normalize_run_row(run_row)
+        linked_task_id = str(run.get('linked_task_id') or run.get('task_id') or '')
+        if linked_task_id and linked_task_id != source_task_id:
+            raise ValueError('source_run_id is linked to a different task')
+    now = utc_now()
+    item = {
+        'id': uuid.uuid4().hex,
+        'source_task_id': source_task_id,
+        'source_run_id': source_run_id,
+        'agent_id': str(payload.get('agent_id') or task.get('agent_id') or ''),
+        'agent_name_snapshot': str(payload.get('agent_name_snapshot') or task.get('assigned_agent_name') or ''),
+        'playbook_id': str(payload.get('playbook_id') or task.get('playbook_id') or ''),
+        'playbook_name': str(payload.get('playbook_name') or task.get('linked_playbook_name') or ''),
+        'title': title,
+        'content': content,
+        'output_type': str(payload.get('output_type', payload.get('type', 'generic')) or 'generic').strip().lower() or 'generic',
+        'format_hint': str(payload.get('format_hint', payload.get('formatHint', '')) or '').strip(),
+        'status': str(payload.get('status') or 'generated').strip().lower() or 'generated',
+        'generation_source': str(payload.get('generation_source', payload.get('generationSource', '')) or '').strip(),
+        'generation_note': str(payload.get('generation_note', payload.get('generationNote', '')) or '').strip(),
+        'context_summary': str(payload.get('context_summary', payload.get('contextSummary', '')) or '').strip(),
+        'created_by': str(payload.get('created_by', payload.get('createdBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'created_at': now,
+        'updated_at': now,
+    }
+    conn.execute(
+        """
+        INSERT INTO task_outputs (
+          id, source_task_id, source_run_id, agent_id, agent_name_snapshot, playbook_id, playbook_name, title, content, output_type, format_hint, status, generation_source, generation_note, context_summary, created_by, created_at, updated_at
+        ) VALUES (
+          :id, :source_task_id, :source_run_id, :agent_id, :agent_name_snapshot, :playbook_id, :playbook_name, :title, :content, :output_type, :format_hint, :status, :generation_source, :generation_note, :context_summary, :created_by, :created_at, :updated_at
+        )
+        """,
+        item,
+    )
+    return normalize_task_output_row(item, conn)
 
 
 def task_memory_count(conn: sqlite3.Connection, task_id: str) -> int:
@@ -2591,6 +2762,247 @@ def proposal_reject(proposal_id: str, payload: dict | None = None) -> dict:
 
 
 
+
+def build_task_output_generation_context(conn: sqlite3.Connection, task: dict) -> dict:
+    task_id = str(task.get('id') or '')
+    runs = task_runs_list(conn, task_id)
+    memories = task_memories_list(conn, task_id)
+    proposals = task_proposals_list(conn, task_id)
+    outputs = task_outputs_list(conn, task_id)
+    latest_run = runs[0] if runs else None
+    latest_memory = memories[0] if memories else None
+    latest_proposal = proposals[0] if proposals else None
+    latest_output = outputs[0] if outputs else None
+    agent = None
+    playbook = None
+    agent_id = str(task.get('agent_id') or '')
+    playbook_id = str(task.get('playbook_id') or '')
+    if agent_id:
+        agent_row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+        if agent_row is not None:
+            agent = normalize_agent_row(agent_row)
+    if playbook_id:
+        playbook_row = conn.execute("SELECT * FROM playbooks WHERE id = ?", (playbook_id,)).fetchone()
+        if playbook_row is not None:
+            playbook = normalize_playbook_row(playbook_row)
+    return {
+        'task': task,
+        'runs': runs,
+        'latest_run': latest_run,
+        'memories': memories,
+        'latest_memory': latest_memory,
+        'proposals': proposals,
+        'latest_proposal': latest_proposal,
+        'outputs': outputs,
+        'latest_output': latest_output,
+        'agent': agent,
+        'playbook': playbook,
+    }
+
+
+def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    if not task_id:
+        raise ValueError('task_id is required')
+    output = None
+    final_run = None
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise ResourceNotFoundError('task', task_id)
+        task = normalize_task_row(task_row, conn)
+        if task is None:
+            raise ResourceNotFoundError('task', task_id)
+        context = build_task_output_generation_context(conn, task)
+        latest_run = context['latest_run']
+        latest_memory = context['latest_memory']
+        latest_proposal = context['latest_proposal']
+        latest_output = context['latest_output']
+        agent = context['agent']
+        playbook = context['playbook']
+
+        output_type = str(payload.get('output_type', payload.get('outputType', payload.get('type', 'generic'))) or 'generic').strip().lower() or 'generic'
+        format_hint = str(payload.get('format_hint', payload.get('formatHint', '')) or '').strip()
+        generation_source = str(payload.get('generation_source', payload.get('generationSource', 'heuristic_task_output_v1')) or 'heuristic_task_output_v1').strip() or 'heuristic_task_output_v1'
+        generation_note = str(payload.get('generation_note', payload.get('generationNote', 'Generated from live task, run, memory, proposal, and playbook context.')) or '').strip()
+        created_by = str(payload.get('created_by', payload.get('createdBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator'
+        task_title = str(task.get('title') or 'Untitled task').strip() or 'Untitled task'
+        task_instruction = trim_run_text(str(task.get('instruction') or task.get('description') or ''), 320)
+        latest_run_summary = trim_run_text(str((latest_run or {}).get('summary') or (latest_run or {}).get('result_text') or ''), 220)
+        latest_memory_summary = trim_run_text(str((latest_memory or {}).get('content') or (latest_memory or {}).get('title') or ''), 180)
+        latest_proposal_summary = trim_run_text(str((latest_proposal or {}).get('content') or (latest_proposal or {}).get('title') or ''), 180)
+        latest_output_summary = trim_run_text(str((latest_output or {}).get('content') or (latest_output or {}).get('title') or ''), 180)
+        audit_note = trim_run_text(str(task.get('audit_note') or ''), 180)
+        last_note = trim_run_text(str(task.get('last_note') or ''), 180)
+        result_text = trim_run_text(str(task.get('result_text') or ''), 180)
+        agent_name = str((agent or {}).get('name') or task.get('assigned_agent_name') or '').strip()
+        playbook_name = str((playbook or {}).get('name') or task.get('linked_playbook_name') or '').strip()
+
+        signal_parts = []
+        if task_instruction:
+            signal_parts.append(f"Task instruction: {task_instruction}")
+        if latest_run_summary:
+            signal_parts.append(f"Latest run: {latest_run_summary}")
+        elif result_text:
+            signal_parts.append(f"Latest result: {result_text}")
+        if audit_note:
+            signal_parts.append(f"Audit note: {audit_note}")
+        if last_note:
+            signal_parts.append(f"Operator note: {last_note}")
+        if latest_memory_summary:
+            signal_parts.append(f"Vault context: {latest_memory_summary}")
+        if latest_proposal_summary:
+            signal_parts.append(f"Proposal context: {latest_proposal_summary}")
+        if latest_output_summary:
+            signal_parts.append(f"Previous output: {latest_output_summary}")
+        if playbook_name:
+            signal_parts.append(f"Playbook: {playbook_name}")
+        if agent_name:
+            signal_parts.append(f"Assignee: {agent_name}")
+        if format_hint:
+            signal_parts.append(f"Format hint: {format_hint}")
+        context_summary = trim_run_text(' | '.join(part for part in signal_parts if str(part or '').strip()), 280)
+
+        requested_title = str(payload.get('title') or '').strip()
+        title = requested_title or f"{task_title} Output"
+
+        def brief_lines():
+            return [
+                f"# {title}",
+                '',
+                '## Objective',
+                task_instruction or f"Produce a usable deliverable for {task_title}.",
+                '',
+                '## Executive Summary',
+                trim_run_text(f"This draft supports {task_title}. It reflects the current task instruction, live task state, and the strongest recent execution signals available in the workspace.", 280),
+                '',
+                '## Key Points',
+                f"- Assignee: {agent_name or 'Unassigned'}",
+                f"- Playbook: {playbook_name or 'None linked'}",
+                f"- Task status: {str(task.get('status') or 'backlog').replace('_', ' ').title()}",
+                f"- Latest signal: {latest_run_summary or result_text or last_note or 'No recent signal captured yet.'}",
+                '',
+                '## Recommended Next Step',
+                trim_run_text(last_note or audit_note or 'Review this draft, tighten wording if needed, then use it as the working output for the task.', 220),
+            ]
+
+        def checklist_lines():
+            base_signal = latest_run_summary or result_text or last_note or 'Confirm the latest task context before sending.'
+            return [
+                f"# {title}",
+                '',
+                '## Checklist',
+                f"- Reconfirm the objective: {task_instruction or task_title}",
+                f"- Review the latest execution signal: {base_signal}",
+                f"- Apply the linked playbook guidance: {playbook_name or 'No linked playbook'}",
+                f"- Incorporate memory/proposal context: {latest_memory_summary or latest_proposal_summary or 'No extra context saved yet.'}",
+                '- Finalize the deliverable and save/send it through the next operator step.',
+            ]
+
+        def response_lines():
+            intro = trim_run_text(task_instruction or f"Follow up on {task_title}.", 220)
+            supporting = trim_run_text(latest_run_summary or result_text or last_note or audit_note or 'No supporting execution note was captured yet.', 220)
+            return [
+                f"# {title}",
+                '',
+                'Hello,',
+                '',
+                trim_run_text(f"Here is the current draft for {task_title.lower()}: {intro}", 260),
+                '',
+                trim_run_text(f"Key context: {supporting}", 260),
+                '',
+                trim_run_text('Next step: review this draft for tone, accuracy, and any task-specific details before sending or publishing it.', 220),
+                '',
+                'Best,',
+                agent_name or 'Operator',
+            ]
+
+        def generic_lines():
+            key_signal = latest_run_summary or result_text or last_note or audit_note or 'No execution signal captured yet.'
+            return [
+                f"# {title}",
+                '',
+                '## Objective',
+                task_instruction or f"Produce a usable output for {task_title}.",
+                '',
+                '## Draft Deliverable',
+                trim_run_text(f"This output is prepared for {task_title}. Use it as the current working artifact linked to the task workspace.", 260),
+                '',
+                '## Key Considerations',
+                f"- Assignee context: {agent_name or 'Unassigned'}",
+                f"- Playbook context: {playbook_name or 'No linked playbook'}",
+                f"- Latest signal: {key_signal}",
+                f"- Supporting context: {latest_memory_summary or latest_proposal_summary or 'No saved memory/proposal context yet.'}",
+                '',
+                '## Operator Next Step',
+                trim_run_text(format_hint or 'Review the draft, tighten specifics, then use this as the persisted task output for follow-up work.', 220),
+            ]
+
+        if output_type in {'brief', 'summary'}:
+            content = '\n'.join(brief_lines()).strip()
+        elif output_type == 'checklist':
+            content = '\n'.join(checklist_lines()).strip()
+        elif output_type in {'response', 'email', 'reply'} or 'email' in format_hint.lower():
+            content = '\n'.join(response_lines()).strip()
+        else:
+            content = '\n'.join(generic_lines()).strip()
+
+        ctx = run_context_for_task(conn, task_id=task_id, task=task)
+        create_ctx = {key: value for key, value in ctx.items() if key != 'result_text'}
+        run = create_run_record(
+            conn,
+            run_type='task_run',
+            title=trim_run_text(f"Generate output: {task_title}", 140),
+            status='queued',
+            summary='Task output generation queued.',
+            run_detail='Preparing task context for output generation.',
+            result_label='Queued',
+            trigger_label='Task output generation',
+            log_preview='Collecting task, run, memory, proposal, and playbook context.',
+            run_source='user',
+            run_purpose='task_output_generation',
+            **create_ctx,
+        )
+        task_event_create(conn, task_id, 'output_generation_requested', f"Output generation requested for: {task_title}.", note=context_summary or generation_note, metadata={'run_id': run['id'], 'output_type': output_type, 'format_hint': format_hint, 'generation_source': generation_source})
+        append_trace_event(conn, run['id'], event_type='planning', event_label='Planning output generation', event_detail='Preparing the task output request and output format.', event_status='success', metadata={'task_id': task_id, 'output_type': output_type})
+        mark_run_running(conn, run['id'], summary=trim_run_text(f"Generating output for task \"{task_title}\".", 220), run_detail='Assembling live task context and rendering the first persisted output draft.', result_label='Running', result_summary=trim_run_text(context_summary, 220), output_status='running', log_preview=trim_run_text(context_summary or generation_note, 420), trigger_label='Task output generation', **create_ctx)
+        append_trace_event(conn, run['id'], event_type='context_assembly', event_label='Context assembled', event_detail='Collected task, run, memory, proposal, and playbook context for output generation.', event_status='success', metadata={'task_id': task_id, 'memory_count': len(context['memories']), 'proposal_count': len(context['proposals']), 'existing_output_count': len(context['outputs'])})
+        try:
+            output = create_task_output_record(conn, {
+                'source_task_id': task_id,
+                'source_run_id': run['id'],
+                'agent_id': task.get('agent_id') or '',
+                'agent_name_snapshot': task.get('assigned_agent_name') or '',
+                'playbook_id': task.get('playbook_id') or '',
+                'playbook_name': task.get('linked_playbook_name') or '',
+                'title': title,
+                'content': content,
+                'output_type': output_type,
+                'format_hint': format_hint,
+                'status': 'success',
+                'generation_source': generation_source,
+                'generation_note': generation_note,
+                'context_summary': context_summary,
+                'created_by': created_by,
+            })
+            append_trace_event(conn, run['id'], event_type='result_assembly', event_label='Output rendered', event_detail='Rendered the output draft and saved a durable task output record.', event_status='success', metadata={'task_id': task_id, 'output_id': output['id']})
+            now = utc_now()
+            conn.execute("UPDATE tasks SET result_text = ?, last_note = ?, updated_at = ? WHERE id = ?", (content, generation_note or task.get('last_note') or '', now, task_id))
+            task_event_create(conn, task_id, 'output_generated', f"Generated task output: {title}.", note=context_summary or generation_note, metadata={'run_id': run['id'], 'output_id': output['id'], 'output_type': output_type})
+            task_event_create(conn, task_id, 'output_saved', f"Saved generated output: {title}.", note=trim_run_text(content, 240), metadata={'run_id': run['id'], 'output_id': output['id'], 'output_type': output_type})
+            task_event_create(conn, task_id, 'result_saved', 'Result/output updated.', note=trim_run_text(content, 240), metadata={'has_result': True, 'run_id': run['id'], 'output_id': output['id']})
+            final_run = complete_run_record(conn, run['id'], 'completed', summary=trim_run_text(f"Generated output for task \"{task_title}\".", 220), run_detail='Saved a durable task output record and synced the task result field.', result_label='Generated', result_summary=trim_run_text(context_summary or title, 220), result_text=content, output_status='success', log_preview=trim_run_text(title + ' · ' + (context_summary or generation_note), 420), trigger_label='Task output generation', changed_fields=['Result', 'Outputs'], metadata={**run_context_metadata(task_id=task_id, task_title=task_title, agent_id=task.get('agent_id',''), deployment_id=create_ctx.get('deployment_id',''), deployment_target=create_ctx.get('deployment_target_snapshot',''), deployment_type=create_ctx.get('deployment_type_snapshot','')), 'output_id': output['id'], 'output_type': output_type, 'generation_source': generation_source, 'format_hint': format_hint})
+            conn.commit()
+        except Exception as exc:
+            append_trace_event(conn, run['id'], event_type='result_assembly', event_label='Output generation failed', event_detail=trim_run_text(str(exc), 220), event_status='failed', metadata={'task_id': task_id})
+            complete_run_record(conn, run['id'], 'failed', summary=trim_run_text(f"Output generation failed for task \"{task_title}\".", 220), run_detail='The task output generation flow failed before it could save a durable output record.', result_label='Failed', result_summary=trim_run_text(str(exc), 220), result_text='', output_status='failed', error_message=trim_run_text(str(exc), 220), log_preview=trim_run_text(str(exc), 420), trigger_label='Task output generation')
+            task_event_create(conn, task_id, 'output_generation_failed', f"Output generation failed for: {task_title}.", note=str(exc), metadata={'run_id': run['id'], 'output_type': output_type, 'generation_source': generation_source})
+            conn.commit()
+            raise
+    detail = task_get(task_id)
+    return {**detail, 'output': output, 'run': final_run}
+
+
 def build_task_proposal_generation_context(conn: sqlite3.Connection, task: dict) -> dict:
     task_id = str(task.get('id') or '')
     runs = task_runs_list(conn, task_id)
@@ -3242,6 +3654,8 @@ def task_get(task_id: str):
         latest_run = runs[0] if runs else None
         linked_memories = task_memories_list(conn, task_id)
         linked_proposals = task_proposals_list(conn, task_id)
+        linked_outputs = task_outputs_list(conn, task_id)
+        latest_output = linked_outputs[0] if linked_outputs else None
         task['runs'] = runs
         task['latest_run'] = latest_run
         task['linked_memories'] = linked_memories
@@ -3252,7 +3666,13 @@ def task_get(task_id: str):
         task['linkedProposals'] = linked_proposals
         task['proposal_count'] = len(linked_proposals)
         task['proposalCount'] = len(linked_proposals)
-        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals), 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
+        task['linked_outputs'] = linked_outputs
+        task['linkedOutputs'] = linked_outputs
+        task['output_count'] = len(linked_outputs)
+        task['outputCount'] = len(linked_outputs)
+        task['latest_output'] = latest_output
+        task['latestOutput'] = latest_output
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals), 'linked_outputs': linked_outputs, 'output_count': len(linked_outputs), 'latest_output': latest_output, 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
 
 
 def task_history_get(task_id: str):
@@ -4626,6 +5046,10 @@ RUN_PURPOSE_PRESENTATION = {
     'execution': {
         'purpose_label': 'Execution',
         'purpose_badge': 'Exec',
+    },
+    'task_output_generation': {
+        'purpose_label': 'Output Generation',
+        'purpose_badge': 'Output',
     },
     'test': {
         'purpose_label': 'Test',
@@ -6135,7 +6559,7 @@ def task_runs_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
     if not task_id:
         return []
     rows = conn.execute(
-        RUN_SELECT + " WHERE r.linked_task_id = ? AND lower(COALESCE(r.run_source, '')) = 'task' AND lower(COALESCE(r.run_purpose, '')) IN ('execution', 'task_execution') ORDER BY COALESCE(NULLIF(r.started_at, ''), r.created_at) DESC, r.created_at DESC, r.id DESC",
+        RUN_SELECT + " WHERE r.linked_task_id = ? ORDER BY COALESCE(NULLIF(r.started_at, ''), r.created_at) DESC, r.created_at DESC, r.id DESC",
         (task_id,),
     ).fetchall()
     return [normalize_run_row(row) for row in rows if row is not None]
@@ -7640,6 +8064,7 @@ class Handler(BaseHTTPRequestHandler):
             proposal_reject_match = re.fullmatch(r"/api/proposals/([^/]+)/reject", parsed.path)
             proposal_apply_match = re.fullmatch(r"/api/proposals/([^/]+)/apply", parsed.path)
             task_generate_proposal_match = re.fullmatch(r"/api/tasks/([^/]+)/generate-proposal", parsed.path)
+            task_generate_output_match = re.fullmatch(r"/api/tasks/([^/]+)/generate-output", parsed.path)
             adaptation_update_match = re.fullmatch(r"/api/adaptations/update", parsed.path)
             if parsed.path == "/api/proposals":
                 self.send_json(proposal_record_create(payload), 201)
@@ -7649,6 +8074,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if task_generate_proposal_match:
                 self.send_json(generate_proposal_draft(task_generate_proposal_match.group(1), payload), 201)
+                return
+            if task_generate_output_match:
+                self.send_json(generate_task_output(task_generate_output_match.group(1), payload), 201)
                 return
             if approval_request_match:
                 self.send_json(proposal_request_approval(approval_request_match.group(1), payload))
