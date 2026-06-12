@@ -453,13 +453,53 @@ Next recommended phase:
 - Implementation Phase 16 — Proposal Automation V1
 - applied execution is now real; the next highest-value gap is generating stronger proposal candidates automatically from task/run/memory/audit context instead of relying on fully manual proposal authoring
 
+### Implementation Phase 16 — Proposal Automation V1
+Status: confirmed complete
+Date: 2026-06-12
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+
+What shipped:
+- proposal records can now be generated directly from live task context instead of requiring fully manual authoring every time
+- generated proposals are persisted as normal proposal records inside the same shared task workspace, with manual/generated provenance preserved instead of hidden transient suggestions
+- operators now get generation rationale, confidence metadata, context snapshots, and generation-source visibility before using the normal proposal governance flow
+- duplicate generation attempts now reuse the latest matching generated draft instead of flooding the task with identical proposal spam
+- the existing review -> approval -> apply chain remains intact, so proposal automation improves candidate creation without bypassing governance or adaptation safety controls
+
+Routes / data changes:
+- extended proposal fields: `origin`, `generation_source`, `confidence_label`, `confidence_score`, `generation_note`, `context_snapshot`, `generated_at`, `regenerated_from_proposal_id`, `is_generated`, `originLabel`
+- extended list route: `GET /api/proposals` now supports `origin`
+- extended write/update routes: `POST /api/proposals`, `PUT /api/proposals/:id` now preserve generated/manual provenance metadata
+- new proposal generation route: `POST /api/tasks/:id/generate-proposal`
+- task history events added: `proposal_generated`, `proposal_generation_regenerated`, `proposal_generation_context_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for generated draft creation, generated/manual provenance, confidence/context metadata persistence, dedupe on repeated generation, task-linked proposal retrieval, `origin=generated` filtering, and generated proposal movement into the normal governance path
+- browser QA from the live task workspace with the same task reopened from list/board, Proposals tab generation visible, generated-draft metadata rendered, generated proposal selected in place, and UI-driven send-for-approval plus approve flow verified with matching history entries
+- cleanup sweep removed the temporary Phase 16 QA task, linked memory, linked proposal, and task events, then confirmed no lingering `Phase 16 QA Task` or generated Phase 16 proposal rows remained in API/DB verification checks
+- live runtime confirmed on `http://127.0.0.1:50000` with the active `server.py` process serving the updated code path
+
+Deferred:
+- model-backed proposal synthesis beyond the current heuristic task-context generator
+- batch candidate ranking / scoring across tasks
+- autonomous approval or apply behavior
+
+Next recommended phase:
+- Implementation Phase 17 — Vault Intelligence V1
+- generated proposals now exist, but the biggest quality gap is richer retrieval and synthesis from accumulated vault memory so future suggestions are driven by stronger reusable knowledge instead of only recent task-local context
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, memory capture, proposals, approval governance, and applied adaptation execution in one shared flow**
+- **task workspace is real and now includes execution, audit, delegation, memory capture, manual/generated proposals, approval governance, and applied adaptation execution in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -471,7 +511,7 @@ What feels strongest now:
 - task-level audit workflow
 - manual parent/child delegation inside the task workspace
 - task-linked memory capture and retrieval
-- task-linked proposal capture and lifecycle updates
+- task-linked proposal capture plus generated draft creation
 - approval-governed proposal review and application controls
 - durable applied adaptation execution with observable lifecycle state
 
@@ -481,7 +521,7 @@ What is still clearly missing from the canon product:
 - deeper Audit beyond V1
 - deeper task workspace richness beyond V1
 - richer vault intelligence beyond operator-curated V1 capture
-- proposal automation beyond operator-driven V1 capture
+- higher-quality proposal synthesis beyond heuristic V1 generation
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
 ---
@@ -491,20 +531,20 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 16 — Proposal Automation V1**
+**Implementation Phase 17 — Vault Intelligence V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, explicit proposal records, approval governance, and real applied execution state
-- the highest-value remaining gap is reducing manual proposal authoring by turning accumulated task/run/memory/audit context into better structured proposal candidates
-- Proposal Automation V1 fits naturally next because the downstream review + apply + execution path is now real and can safely receive higher-quality machine-generated suggestions
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, generated/manual proposal records, approval governance, and real applied execution state
+- Proposal Automation V1 reduced manual authoring, but proposal quality is still bounded by shallow task-local heuristics and weak retrieval over accumulated vault knowledge
+- Vault Intelligence V1 is the best next layer because it would improve both operator recall and proposal quality without jumping prematurely into autonomous multi-step orchestration
 
-Proposal Automation V1 should likely add:
-- operator-visible draft proposal generation from task/run/memory/audit context
-- confidence / rationale metadata so generated proposals remain reviewable instead of opaque AI suggestions
-- lightweight proposal batching or suggestion surfacing inside the existing task workspace without bypassing approval or execution controls
+Vault Intelligence V1 should likely add:
+- stronger retrieval and ranking across saved vault records tied to task context
+- reusable memory synthesis or “relevant lessons” surfacing inside the task workspace before proposal generation
+- better context packaging so generated proposals can draw from more than the latest local task note/run/memory snapshot
 
 Alternative after that:
-- deeper Delegation V2 or richer vault intelligence / memory reasoning
+- deeper Delegation V2 or multi-step adaptation orchestration
 
 ---
 
@@ -576,12 +616,13 @@ Current reality:
 - Proposals V1 is now real
 - Approval-Governed Adaptation V1 is now real
 - Applied Adaptation Execution V1 is now real
+- Proposal Automation V1 is now real
 
 Main missing product layers:
-- proposal automation beyond operator-driven V1
+- richer vault intelligence beyond curated V1 capture
+- higher-quality proposal synthesis beyond heuristic V1 generation
 - deeper delegation/orchestration depth
-- richer memory intelligence beyond curated V1 capture
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
-Current best next step after Phase 15:
-- **Implementation Phase 16 — Proposal Automation V1**
+Current best next step after Phase 16:
+- **Implementation Phase 17 — Vault Intelligence V1**

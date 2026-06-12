@@ -1193,6 +1193,14 @@ def init_board():
               source_memory_id TEXT DEFAULT '',
               source_audit_state TEXT DEFAULT '',
               source_context_summary TEXT DEFAULT '',
+              origin TEXT NOT NULL DEFAULT 'manual',
+              generation_source TEXT DEFAULT '',
+              confidence_label TEXT DEFAULT '',
+              confidence_score REAL NOT NULL DEFAULT 0,
+              generation_note TEXT DEFAULT '',
+              context_snapshot TEXT DEFAULT '',
+              generated_at TEXT DEFAULT '',
+              regenerated_from_proposal_id TEXT DEFAULT '',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )
@@ -1421,6 +1429,14 @@ def init_board():
             'applied_at': "TEXT DEFAULT ''",
             'reviewed_by': "TEXT DEFAULT 'operator'",
             'adaptation_type': "TEXT DEFAULT ''",
+            'origin': "TEXT NOT NULL DEFAULT 'manual'",
+            'generation_source': "TEXT DEFAULT ''",
+            'confidence_label': "TEXT DEFAULT ''",
+            'confidence_score': "REAL NOT NULL DEFAULT 0",
+            'generation_note': "TEXT DEFAULT ''",
+            'context_snapshot': "TEXT DEFAULT ''",
+            'generated_at': "TEXT DEFAULT ''",
+            'regenerated_from_proposal_id': "TEXT DEFAULT ''",
         }
         for column, ddl in proposal_column_defaults.items():
             if column not in proposal_columns:
@@ -2027,6 +2043,18 @@ def normalize_proposal_row(row, conn: sqlite3.Connection | None = None) -> dict 
     item['source_memory_id'] = str(item.get('source_memory_id') or '')
     item['source_audit_state'] = normalize_audit_state(item.get('source_audit_state') or '')
     item['source_context_summary'] = str(item.get('source_context_summary') or '')
+    item['origin'] = str(item.get('origin') or 'manual').strip().lower() or 'manual'
+    item['generation_source'] = str(item.get('generation_source') or '')
+    item['confidence_label'] = str(item.get('confidence_label') or '')
+    try:
+        item['confidence_score'] = float(item.get('confidence_score') or 0)
+    except (TypeError, ValueError):
+        item['confidence_score'] = 0.0
+    item['generation_note'] = str(item.get('generation_note') or '')
+    item['context_snapshot'] = str(item.get('context_snapshot') or '')
+    item['generated_at'] = str(item.get('generated_at') or '')
+    item['regenerated_from_proposal_id'] = str(item.get('regenerated_from_proposal_id') or '')
+    item['is_generated'] = item['origin'] == 'generated'
     item['created_at'] = str(item.get('created_at') or '')
     item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
     item['proposalType'] = item['proposal_type']
@@ -2041,6 +2069,15 @@ def normalize_proposal_row(row, conn: sqlite3.Connection | None = None) -> dict 
     item['sourceMemoryId'] = item['source_memory_id']
     item['sourceAuditState'] = item['source_audit_state']
     item['sourceContextSummary'] = item['source_context_summary']
+    item['originLabel'] = 'Generated' if item['is_generated'] else 'Manual'
+    item['generationSource'] = item['generation_source']
+    item['confidenceLabel'] = item['confidence_label']
+    item['confidenceScore'] = item['confidence_score']
+    item['generationNote'] = item['generation_note']
+    item['contextSnapshot'] = item['context_snapshot']
+    item['generatedAt'] = item['generated_at']
+    item['regeneratedFromProposalId'] = item['regenerated_from_proposal_id']
+    item['isGenerated'] = item['is_generated']
     item['createdAt'] = item['created_at']
     item['updatedAt'] = item['updated_at']
     item['source_task'] = None
@@ -2111,7 +2148,7 @@ def proposal_record_get(proposal_id: str):
         return {'proposal': normalize_proposal_row(row, conn)}
 
 
-def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', memory_id: str = '', status: str = '', approval_state: str = '') -> dict:
+def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', memory_id: str = '', status: str = '', approval_state: str = '', origin: str = '') -> dict:
     with connect_board() as conn:
         where = []
         params: list[str] = []
@@ -2121,6 +2158,7 @@ def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', 
         clean_memory_id = str(memory_id or '').strip()
         clean_status = normalize_proposal_status(status) if str(status or '').strip() else ''
         clean_approval_state = normalize_approval_state(approval_state) if str(approval_state or '').strip() else ''
+        clean_origin = str(origin or '').strip().lower()
         if clean_task_id:
             where.append("source_task_id = ?")
             params.append(clean_task_id)
@@ -2136,17 +2174,20 @@ def proposal_records_list(query: str = '', task_id: str = '', run_id: str = '', 
         if clean_approval_state:
             where.append("approval_state = ?")
             params.append(clean_approval_state)
+        if clean_origin:
+            where.append("lower(COALESCE(origin,'manual')) = ?")
+            params.append(clean_origin)
         if clean_query:
-            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(proposal_type) LIKE ? OR lower(source_context_summary) LIKE ? OR lower(approval_note) LIKE ? OR lower(adaptation_type) LIKE ?)")
+            where.append("(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(proposal_type) LIKE ? OR lower(source_context_summary) LIKE ? OR lower(approval_note) LIKE ? OR lower(adaptation_type) LIKE ? OR lower(COALESCE(generation_note,'')) LIKE ? OR lower(COALESCE(context_snapshot,'')) LIKE ?)")
             needle = f"%{clean_query.lower()}%"
-            params.extend([needle, needle, needle, needle, needle, needle])
+            params.extend([needle, needle, needle, needle, needle, needle, needle, needle])
         sql = "SELECT * FROM proposals"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY updated_at DESC, created_at DESC, id DESC"
         rows = conn.execute(sql, tuple(params)).fetchall()
         proposals = [normalize_proposal_row(row, conn) for row in rows if row is not None]
-        return {'proposals': proposals, 'count': len(proposals), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id, 'source_memory_id': clean_memory_id, 'status': clean_status, 'approval_state': clean_approval_state}
+        return {'proposals': proposals, 'count': len(proposals), 'query': clean_query, 'source_task_id': clean_task_id, 'source_run_id': clean_run_id, 'source_memory_id': clean_memory_id, 'status': clean_status, 'approval_state': clean_approval_state, 'origin': clean_origin}
 
 
 def proposal_record_create(payload: dict | None = None) -> dict:
@@ -2165,6 +2206,17 @@ def proposal_record_create(payload: dict | None = None) -> dict:
     source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', payload.get('memoryId', '')))) or '').strip()
     source_audit_state = normalize_audit_state(payload.get('source_audit_state', payload.get('audit_state', payload.get('sourceAuditState', payload.get('auditState', '')))))
     source_context_summary = str(payload.get('source_context_summary', payload.get('context_summary', payload.get('sourceContextSummary', payload.get('contextSummary', '')))) or '').strip()
+    origin = str(payload.get('origin', payload.get('proposal_origin', payload.get('proposalOrigin', 'manual'))) or 'manual').strip().lower() or 'manual'
+    generation_source = str(payload.get('generation_source', payload.get('generationSource', '')) or '').strip()
+    confidence_label = str(payload.get('confidence_label', payload.get('confidenceLabel', '')) or '').strip()
+    try:
+        confidence_score = float(payload.get('confidence_score', payload.get('confidenceScore', 0)) or 0)
+    except (TypeError, ValueError):
+        confidence_score = 0.0
+    generation_note = str(payload.get('generation_note', payload.get('generationNote', '')) or '').strip()
+    context_snapshot = str(payload.get('context_snapshot', payload.get('contextSnapshot', '')) or '').strip()
+    generated_at = str(payload.get('generated_at', payload.get('generatedAt', '')) or '').strip()
+    regenerated_from_proposal_id = str(payload.get('regenerated_from_proposal_id', payload.get('regeneratedFromProposalId', '')) or '').strip()
     if not title:
         raise ValueError('title is required')
     if not content:
@@ -2201,6 +2253,16 @@ def proposal_record_create(payload: dict | None = None) -> dict:
         now = utc_now()
         approval_updated_at = now if approval_note or approval_state != 'not_requested' else ''
         applied_at = now if approval_state == 'applied' or status == 'applied' else ''
+        if origin == 'generated' and not generated_at:
+            generated_at = now
+        if origin != 'generated':
+            generation_source = ''
+            confidence_label = ''
+            confidence_score = 0.0
+            generation_note = ''
+            context_snapshot = ''
+            generated_at = ''
+            regenerated_from_proposal_id = ''
         if status == 'rejected' and not governance_action:
             raise ValueError('rejection decisions must use the governed proposal workflow route')
         if approval_state in ('approved', 'rejected', 'applied'):
@@ -2230,15 +2292,23 @@ def proposal_record_create(payload: dict | None = None) -> dict:
             'source_memory_id': source_memory_id,
             'source_audit_state': source_audit_state,
             'source_context_summary': source_context_summary,
+            'origin': origin,
+            'generation_source': generation_source,
+            'confidence_label': confidence_label,
+            'confidence_score': confidence_score,
+            'generation_note': generation_note,
+            'context_snapshot': context_snapshot,
+            'generated_at': generated_at,
+            'regenerated_from_proposal_id': regenerated_from_proposal_id,
             'created_at': now,
             'updated_at': now,
         }
         conn.execute(
             """
             INSERT INTO proposals (
-              id, title, content, proposal_type, status, approval_state, approval_note, approval_updated_at, applied_at, reviewed_by, adaptation_type, source_task_id, source_run_id, source_memory_id, source_audit_state, source_context_summary, created_at, updated_at
+              id, title, content, proposal_type, status, approval_state, approval_note, approval_updated_at, applied_at, reviewed_by, adaptation_type, source_task_id, source_run_id, source_memory_id, source_audit_state, source_context_summary, origin, generation_source, confidence_label, confidence_score, generation_note, context_snapshot, generated_at, regenerated_from_proposal_id, created_at, updated_at
             ) VALUES (
-              :id, :title, :content, :proposal_type, :status, :approval_state, :approval_note, :approval_updated_at, :applied_at, :reviewed_by, :adaptation_type, :source_task_id, :source_run_id, :source_memory_id, :source_audit_state, :source_context_summary, :created_at, :updated_at
+              :id, :title, :content, :proposal_type, :status, :approval_state, :approval_note, :approval_updated_at, :applied_at, :reviewed_by, :adaptation_type, :source_task_id, :source_run_id, :source_memory_id, :source_audit_state, :source_context_summary, :origin, :generation_source, :confidence_label, :confidence_score, :generation_note, :context_snapshot, :generated_at, :regenerated_from_proposal_id, :created_at, :updated_at
             )
             """,
             item,
@@ -2257,8 +2327,23 @@ def proposal_record_create(payload: dict | None = None) -> dict:
                 'source_run_id': source_run_id,
                 'source_memory_id': source_memory_id,
                 'source_audit_state': source_audit_state,
+                'origin': origin,
             },
         )
+        if origin == 'generated':
+            task_event_create(
+                conn,
+                source_task_id,
+                'proposal_generated',
+                f"Generated proposal draft: {title}.",
+                note=generation_note or content,
+                metadata={
+                    'proposal_id': item['id'],
+                    'generation_source': generation_source,
+                    'confidence_label': confidence_label,
+                    'confidence_score': confidence_score,
+                },
+            )
         conn.commit()
         proposal = normalize_proposal_row(item, conn)
         return {'proposal': proposal, 'task': task, 'source_run': run, 'source_memory': memory}
@@ -2288,6 +2373,17 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
         source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', existing.get('source_memory_id') or ''))) or '').strip()
         source_audit_state = normalize_audit_state(payload.get('source_audit_state', payload.get('audit_state', payload.get('sourceAuditState', existing.get('source_audit_state') or ''))))
         source_context_summary = str(payload.get('source_context_summary', payload.get('context_summary', payload.get('sourceContextSummary', existing.get('source_context_summary') or ''))) or '').strip()
+        origin = str(payload.get('origin', payload.get('proposal_origin', payload.get('proposalOrigin', existing.get('origin') or 'manual'))) or 'manual').strip().lower() or 'manual'
+        generation_source = str(payload.get('generation_source', payload.get('generationSource', existing.get('generation_source') or '')) or '').strip()
+        confidence_label = str(payload.get('confidence_label', payload.get('confidenceLabel', existing.get('confidence_label') or '')) or '').strip()
+        try:
+            confidence_score = float(payload.get('confidence_score', payload.get('confidenceScore', existing.get('confidence_score') or 0)) or 0)
+        except (TypeError, ValueError):
+            confidence_score = float(existing.get('confidence_score') or 0)
+        generation_note = str(payload.get('generation_note', payload.get('generationNote', existing.get('generation_note') or '')) or '').strip()
+        context_snapshot = str(payload.get('context_snapshot', payload.get('contextSnapshot', existing.get('context_snapshot') or '')) or '').strip()
+        generated_at = str(payload.get('generated_at', payload.get('generatedAt', existing.get('generated_at') or '')) or '').strip()
+        regenerated_from_proposal_id = str(payload.get('regenerated_from_proposal_id', payload.get('regeneratedFromProposalId', existing.get('regenerated_from_proposal_id') or '')) or '').strip()
         if not title:
             raise ValueError('title is required')
         if not content:
@@ -2326,6 +2422,16 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
         approval_updated_at = existing.get('approval_updated_at') or ''
         if approval_note != str(existing.get('approval_note') or '') or approval_state != normalize_approval_state(existing.get('approval_state') or '') or reviewed_by != str(existing.get('reviewed_by') or 'operator'):
             approval_updated_at = utc_now()
+        if origin == 'generated' and not generated_at:
+            generated_at = existing.get('generated_at') or utc_now()
+        if origin != 'generated':
+            generation_source = ''
+            confidence_label = ''
+            confidence_score = 0.0
+            generation_note = ''
+            context_snapshot = ''
+            generated_at = ''
+            regenerated_from_proposal_id = ''
         applied_at = str(existing.get('applied_at') or '')
         if approval_state == 'applied' or status == 'applied':
             if not applied_at:
@@ -2348,6 +2454,14 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
             'source_memory_id': source_memory_id,
             'source_audit_state': source_audit_state,
             'source_context_summary': source_context_summary,
+            'origin': origin,
+            'generation_source': generation_source,
+            'confidence_label': confidence_label,
+            'confidence_score': confidence_score,
+            'generation_note': generation_note,
+            'context_snapshot': context_snapshot,
+            'generated_at': generated_at,
+            'regenerated_from_proposal_id': regenerated_from_proposal_id,
             'updated_at': utc_now(),
         }
         conn.execute(
@@ -2367,6 +2481,14 @@ def proposal_record_update(proposal_id: str, payload: dict | None = None) -> dic
                 source_memory_id = :source_memory_id,
                 source_audit_state = :source_audit_state,
                 source_context_summary = :source_context_summary,
+                origin = :origin,
+                generation_source = :generation_source,
+                confidence_label = :confidence_label,
+                confidence_score = :confidence_score,
+                generation_note = :generation_note,
+                context_snapshot = :context_snapshot,
+                generated_at = :generated_at,
+                regenerated_from_proposal_id = :regenerated_from_proposal_id,
                 updated_at = :updated_at
             WHERE id = :id
             """,
@@ -2465,6 +2587,192 @@ def proposal_reject(proposal_id: str, payload: dict | None = None) -> dict:
         'source_task_id': proposal.get('source_task_id') or '',
     }
     return proposal_record_update(proposal_id, update_payload)
+
+
+
+
+def build_task_proposal_generation_context(conn: sqlite3.Connection, task: dict) -> dict:
+    task_id = str(task.get('id') or '')
+    runs = task_runs_list(conn, task_id)
+    memories = task_memories_list(conn, task_id)
+    proposals = task_proposals_list(conn, task_id)
+    adaptations = task_adaptations_list(conn, task_id)
+    latest_run = runs[0] if runs else None
+    latest_memory = memories[0] if memories else None
+    latest_adaptation = adaptations[0] if adaptations else None
+    latest_generated = next((proposal for proposal in proposals if str(proposal.get('origin') or '') == 'generated'), None)
+    return {
+        'task': task,
+        'runs': runs,
+        'latest_run': latest_run,
+        'memories': memories,
+        'latest_memory': latest_memory,
+        'proposals': proposals,
+        'latest_generated': latest_generated,
+        'adaptations': adaptations,
+        'latest_adaptation': latest_adaptation,
+    }
+
+
+def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    if not task_id:
+        raise ValueError('task_id is required')
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise ResourceNotFoundError('task', task_id)
+        task = normalize_task_row(task_row, conn)
+        if task is None:
+            raise ResourceNotFoundError('task', task_id)
+        context = build_task_proposal_generation_context(conn, task)
+        latest_run = context['latest_run']
+        latest_memory = context['latest_memory']
+        latest_adaptation = context['latest_adaptation']
+        generated_count = sum(1 for proposal in context['proposals'] if str(proposal.get('origin') or '') == 'generated')
+
+        signal_parts = []
+        task_title = str(task.get('title') or 'this task').strip() or 'this task'
+        task_instruction = trim_run_text(str(task.get('instruction') or task.get('description') or ''), 220)
+        audit_note = trim_run_text(str(task.get('audit_note') or ''), 180)
+        result_text = trim_run_text(str(task.get('result_text') or ''), 180)
+        last_note = trim_run_text(str(task.get('last_note') or ''), 180)
+        latest_run_summary = trim_run_text(str((latest_run or {}).get('summary') or (latest_run or {}).get('result_text') or ''), 180)
+        latest_memory_title = str((latest_memory or {}).get('title') or '').strip()
+        latest_memory_content = trim_run_text(str((latest_memory or {}).get('content') or ''), 160)
+        latest_adaptation_status = str((latest_adaptation or {}).get('execution_status') or '').strip()
+        latest_adaptation_outcome = trim_run_text(str((latest_adaptation or {}).get('outcome_text') or (latest_adaptation or {}).get('execution_summary') or ''), 160)
+
+        if task_instruction:
+            signal_parts.append(f"Task instruction: {task_instruction}")
+        if audit_note:
+            signal_parts.append(f"Audit note: {audit_note}")
+        if latest_run_summary:
+            signal_parts.append(f"Latest run: {latest_run_summary}")
+        elif result_text:
+            signal_parts.append(f"Latest output: {result_text}")
+        if last_note and last_note not in signal_parts:
+            signal_parts.append(f"Operator note: {last_note}")
+        if latest_memory_title or latest_memory_content:
+            signal_parts.append(f"Vault context: {latest_memory_title or latest_memory_content}")
+        if latest_adaptation_status or latest_adaptation_outcome:
+            signal_parts.append(f"Adaptation status: {latest_adaptation_status or 'none'} {latest_adaptation_outcome}".strip())
+
+        task_status = str(task.get('status') or '').strip().lower()
+        audit_state = str(task.get('audit_state') or '').strip().lower()
+        latest_run_status = str((latest_run or {}).get('status') or '').strip().lower()
+
+        proposal_type = str(payload.get('proposal_type') or payload.get('proposalType') or '').strip().lower()
+        if proposal_type not in PROPOSAL_TYPES:
+            if audit_state in ('rejected', 'revision_requested'):
+                proposal_type = 'quality'
+            elif task_status in ('blocked', 'revision_requested') or latest_run_status == 'failed' or latest_adaptation_status == 'failed':
+                proposal_type = 'workflow'
+            elif latest_memory_title or latest_memory_content:
+                proposal_type = 'memory'
+            else:
+                proposal_type = 'workflow'
+        adaptation_type = str(payload.get('adaptation_type') or payload.get('adaptationType') or proposal_type).strip().lower()
+        if adaptation_type not in PROPOSAL_TYPES:
+            adaptation_type = proposal_type
+
+        if audit_state in ('rejected', 'revision_requested'):
+            title = f"Tighten {task_title} quality gate and retry path"
+            rationale = "Use the audit feedback to make the next execution safer and easier to review."
+        elif latest_run_status == 'failed' or latest_adaptation_status == 'failed' or task_status == 'blocked':
+            title = f"Add failure recovery steps for {task_title}"
+            rationale = "The task hit a visible blocker, so the next proposal should reduce repeat failure and improve operator recovery."
+        elif latest_memory_title or latest_memory_content:
+            title = f"Promote {task_title} lesson into reusable operator guidance"
+            rationale = "The task already produced reusable memory, so the next proposal should turn that into a repeatable workflow improvement."
+        else:
+            title = f"Improve {task_title} workflow clarity and operator handoff"
+            rationale = "The task has enough execution context to suggest a clearer next-step improvement without bypassing human review."
+
+        context_summary = trim_run_text(' | '.join(signal_parts), 240)
+        context_snapshot = trim_run_text('\n'.join(signal_parts), 600)
+        content_lines = [
+            rationale,
+            '',
+            'Suggested change:',
+            f"- Proposal type: {proposal_type.replace('_', ' ')}",
+            f"- Adaptation target: {adaptation_type.replace('_', ' ')}",
+            f"- Why now: {context_summary or 'The task already has enough context to justify a reviewable proposal draft.'}",
+            '- Operator action: review this draft, edit if needed, then accept before sending it into approval.',
+        ]
+        content = '\n'.join(line for line in content_lines if line is not None).strip()
+
+        confidence_score = min(0.95, 0.35 + (0.12 if latest_run else 0) + (0.1 if latest_memory else 0) + (0.1 if audit_note else 0) + (0.1 if latest_adaptation else 0) + (0.05 if task_status in ('blocked', 'revision_requested') else 0))
+        confidence_label = 'high' if confidence_score >= 0.75 else 'medium' if confidence_score >= 0.5 else 'low'
+        generation_source = str(payload.get('generation_source') or payload.get('generationSource') or 'heuristic_task_context_v1').strip() or 'heuristic_task_context_v1'
+        generation_note = str(payload.get('generation_note') or payload.get('generationNote') or 'Generated from live task, run, memory, audit, and adaptation context.').strip()
+        source_run_id = str(payload.get('source_run_id') or payload.get('sourceRunId') or (latest_run or {}).get('id') or '')
+        source_memory_id = str(payload.get('source_memory_id') or payload.get('sourceMemoryId') or (latest_memory or {}).get('id') or '')
+
+        task_event_create(
+            conn,
+            task_id,
+            'proposal_generation_context_saved',
+            f"Prepared proposal generation context for: {task_title}.",
+            note=context_summary or generation_note,
+            metadata={
+                'generation_source': generation_source,
+                'proposal_type': proposal_type,
+                'adaptation_type': adaptation_type,
+                'run_count': len(context['runs']),
+                'memory_count': len(context['memories']),
+                'adaptation_count': len(context['adaptations']),
+                'existing_generated_count': generated_count,
+                'source_run_id': source_run_id,
+                'source_memory_id': source_memory_id,
+            },
+        )
+
+        existing_generated = conn.execute(
+            "SELECT * FROM proposals WHERE source_task_id = ? AND lower(COALESCE(origin,'manual')) = 'generated' ORDER BY updated_at DESC, created_at DESC, id DESC",
+            (task_id,),
+        ).fetchall()
+        for row in existing_generated:
+            existing = normalize_proposal_row(row, conn)
+            if existing and str(existing.get('title') or '') == title and str(existing.get('content') or '') == content:
+                task_event_create(
+                    conn,
+                    task_id,
+                    'proposal_generation_regenerated',
+                    f"Reused generated proposal draft: {title}.",
+                    note=generation_note,
+                    metadata={
+                        'proposal_id': existing.get('id') or '',
+                        'generation_source': generation_source,
+                        'confidence_label': confidence_label,
+                    },
+                )
+                conn.commit()
+                return {'proposal': existing, 'task': task, 'deduped': True, 'generated': True}
+
+    create_payload = {
+        'title': title,
+        'content': content,
+        'proposal_type': proposal_type,
+        'status': 'proposed',
+        'adaptation_type': adaptation_type,
+        'source_task_id': task_id,
+        'source_run_id': source_run_id,
+        'source_memory_id': source_memory_id,
+        'source_audit_state': task.get('audit_state') or '',
+        'source_context_summary': context_summary,
+        'origin': 'generated',
+        'generation_source': generation_source,
+        'confidence_label': confidence_label,
+        'confidence_score': confidence_score,
+        'generation_note': generation_note,
+        'context_snapshot': context_snapshot,
+        'generated_at': utc_now(),
+        'regenerated_from_proposal_id': str((context.get('latest_generated') or {}).get('id') or ''),
+        'reviewed_by': 'operator',
+    }
+    created = proposal_record_create(create_payload)
+    return {**created, 'deduped': False, 'generated': True}
 
 
 def proposal_apply(proposal_id: str, payload: dict | None = None) -> dict:
@@ -7129,7 +7437,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/proposals":
             qs = parse_qs(parsed.query)
-            self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0], approval_state=(qs.get('approval_state') or qs.get('approvalState') or [''])[0]))
+            self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0], approval_state=(qs.get('approval_state') or qs.get('approvalState') or [''])[0], origin=(qs.get('origin') or [''])[0]))
             return
         if parsed.path == "/api/adaptations":
             qs = parse_qs(parsed.query)
@@ -7331,12 +7639,16 @@ class Handler(BaseHTTPRequestHandler):
             proposal_approve_match = re.fullmatch(r"/api/proposals/([^/]+)/approve", parsed.path)
             proposal_reject_match = re.fullmatch(r"/api/proposals/([^/]+)/reject", parsed.path)
             proposal_apply_match = re.fullmatch(r"/api/proposals/([^/]+)/apply", parsed.path)
+            task_generate_proposal_match = re.fullmatch(r"/api/tasks/([^/]+)/generate-proposal", parsed.path)
             adaptation_update_match = re.fullmatch(r"/api/adaptations/update", parsed.path)
             if parsed.path == "/api/proposals":
                 self.send_json(proposal_record_create(payload), 201)
                 return
             if parsed.path == "/api/adaptations":
                 self.send_json(adaptation_execution_create(payload), 201)
+                return
+            if task_generate_proposal_match:
+                self.send_json(generate_proposal_draft(task_generate_proposal_match.group(1), payload), 201)
                 return
             if approval_request_match:
                 self.send_json(proposal_request_approval(approval_request_match.group(1), payload))
