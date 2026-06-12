@@ -411,13 +411,55 @@ Next recommended phase:
 - Implementation Phase 15 — Applied Adaptation Execution V1
 - approval-governed decisions are now explicit; the next highest-value layer is executing approved adaptations through a controlled, observable apply path instead of status-only governance
 
+### Implementation Phase 15 — Applied Adaptation Execution V1
+Status: confirmed complete
+Date: 2026-06-12
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/docs/AGENTFORGE_HANDOFF_CHECKLIST.md`
+
+What shipped:
+- approved proposals now create a real persisted adaptation execution record instead of stopping at governance state only
+- proposal approval state remains separate from execution state, so AgentForge now records both what was allowed and what actually happened during apply
+- the shared task workspace now surfaces adaptation execution count, latest execution state, editable execution summary/note/outcome fields, and operator lifecycle controls without leaving the proposal context
+- operators can move an adaptation execution through a minimal explicit lifecycle and see matching history updates from the same task record
+- task detail and proposal retrieval now expose linked adaptation execution context, making apply outcomes durable, inspectable, and auditable
+
+Routes / data changes:
+- new table: `adaptation_executions`
+- new execution fields: `id`, `proposal_id`, `source_task_id`, `source_run_id`, `source_memory_id`, `proposal_title_snapshot`, `approval_state_snapshot`, `adaptation_type`, `execution_status`, `execution_summary`, `execution_note`, `operator_note`, `outcome_text`, `change_target`, `target_scope`, `created_by`, `applied_by`, `rollback_state`, `rollback_note`, `started_at`, `finished_at`, `created_at`, `updated_at`
+- new execution routes: `GET /api/adaptations`, `GET /api/adaptations/:id`, `GET /api/tasks/:id/adaptations`, `GET /api/proposals/:id/adaptations`, `GET /api/proposals/:id/applications`, `POST /api/adaptations`, `POST /api/adaptations/update?id=...`
+- extended proposal apply path: `POST /api/proposals/:id/apply` now creates or returns a persisted execution record instead of only touching governance metadata
+- additive task/proposal payload fields: `adaptation_count`, `latest_adaptation`, `linked_adaptations`, `adaptationCount`, `latestAdaptation`, `linkedAdaptations`
+- task history events added: `adaptation_apply_started`, `adaptation_apply_succeeded`, `adaptation_apply_failed`, `adaptation_rollback_marked`, `adaptation_execution_note_saved`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke for task create, proposal create, proposal accept, request approval, approve, apply, execution record retrieval, execution status transitions (`pending_apply` -> `applying` -> `applied` -> `rolled_back`), task adaptation counts, and task history events
+- browser QA from the live task workspace with the same task opened from list and board, proposal context visible, execution record created from the UI, execution summary/note/outcome persisted, and history entries rendered in the workspace timeline
+- cleanup sweep removed temporary Phase 15 browser-QA and smoke-test tasks and confirmed no lingering `Phase 15` task titles or phase-specific adaptation rows in API/DB verification checks
+- live runtime confirmed on `http://127.0.0.1:50000` with startup proof from the active `server.py` process
+
+Deferred:
+- automatic proposal generation or execution planning from models
+- automatic rollback engine or structural self-modification
+- richer execution analytics / batching / multi-step orchestration beyond operator-driven V1 transitions
+
+Next recommended phase:
+- Implementation Phase 16 — Proposal Automation V1
+- applied execution is now real; the next highest-value gap is generating stronger proposal candidates automatically from task/run/memory/audit context instead of relying on fully manual proposal authoring
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, memory capture, proposals, and approval-governed adaptation in one shared flow**
+- **task workspace is real and now includes execution, audit, delegation, memory capture, proposals, approval governance, and applied adaptation execution in one shared flow**
 - but the full canon product is still not complete
 
 What feels strongest now:
@@ -431,15 +473,16 @@ What feels strongest now:
 - task-linked memory capture and retrieval
 - task-linked proposal capture and lifecycle updates
 - approval-governed proposal review and application controls
+- durable applied adaptation execution with observable lifecycle state
 
 What is still clearly missing from the canon product:
 - full Agents overhaul
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
-- applied adaptation execution beyond governance state
 - deeper task workspace richness beyond V1
 - richer vault intelligence beyond operator-curated V1 capture
 - proposal automation beyond operator-driven V1 capture
+- multi-step adaptation orchestration beyond operator-driven V1 execution
 
 ---
 
@@ -448,20 +491,20 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 15 — Applied Adaptation Execution V1**
+**Implementation Phase 16 — Proposal Automation V1**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, explicit proposal records, and operator-governed approval state
-- the highest-value remaining gap is turning approved adaptations into controlled applied outcomes instead of only recording governance decisions
-- Applied Adaptation Execution V1 fits naturally next because approval-safe intent is now explicit and can gate the first real execution pathway
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, explicit proposal records, approval governance, and real applied execution state
+- the highest-value remaining gap is reducing manual proposal authoring by turning accumulated task/run/memory/audit context into better structured proposal candidates
+- Proposal Automation V1 fits naturally next because the downstream review + apply + execution path is now real and can safely receive higher-quality machine-generated suggestions
 
-Applied Adaptation Execution V1 should likely add:
-- explicit execution records or outcome logs for applied proposal actions
-- controlled apply workflows that translate approved proposals into visible task/system changes with operator checkpoints
-- rollback-aware or reversible execution metadata so applied adaptations do not become opaque state flips
+Proposal Automation V1 should likely add:
+- operator-visible draft proposal generation from task/run/memory/audit context
+- confidence / rationale metadata so generated proposals remain reviewable instead of opaque AI suggestions
+- lightweight proposal batching or suggestion surfacing inside the existing task workspace without bypassing approval or execution controls
 
 Alternative after that:
-- deeper Delegation V2 or richer proposal generation/analytics
+- deeper Delegation V2 or richer vault intelligence / memory reasoning
 
 ---
 
@@ -532,12 +575,13 @@ Current reality:
 - Memory Vault V1 is now real
 - Proposals V1 is now real
 - Approval-Governed Adaptation V1 is now real
+- Applied Adaptation Execution V1 is now real
 
 Main missing product layers:
-- applied adaptation execution beyond governance state
+- proposal automation beyond operator-driven V1
 - deeper delegation/orchestration depth
 - richer memory intelligence beyond curated V1 capture
-- richer proposal automation beyond operator-driven V1
+- multi-step adaptation orchestration beyond operator-driven V1 execution
 
-Current best next step after Phase 14:
-- **Implementation Phase 15 — Applied Adaptation Execution V1**
+Current best next step after Phase 15:
+- **Implementation Phase 16 — Proposal Automation V1**

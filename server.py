@@ -59,6 +59,27 @@ APPROVAL_STATE_ALIASES = {
     "not_requested": "not_requested",
     "not requested": "not_requested",
 }
+ADAPTATION_EXECUTION_STATUSES = ["pending_apply", "applying", "applied", "failed", "rolled_back"]
+ADAPTATION_EXECUTION_STATUS_ALIASES = {
+    "pending": "pending_apply",
+    "pending_apply": "pending_apply",
+    "pending-apply": "pending_apply",
+    "queued": "pending_apply",
+    "start": "applying",
+    "starting": "applying",
+    "applying": "applying",
+    "in_progress": "applying",
+    "in-progress": "applying",
+    "success": "applied",
+    "succeeded": "applied",
+    "apply": "applied",
+    "applied": "applied",
+    "fail": "failed",
+    "failed": "failed",
+    "rollback": "rolled_back",
+    "rolled_back": "rolled_back",
+    "rolled-back": "rolled_back",
+}
 TASK_STATUSES = ["backlog", "triage", "ready", "in_progress", "review", "revision_requested", "blocked", "completed"]
 TASK_PRIORITIES = ["low", "medium", "high"]
 TASK_STATUS_ALIASES = {"pending": "backlog", "done": "completed", "complete": "completed", "completed": "completed", "revision requested": "revision_requested", "revision-requested": "revision_requested", "in progress": "in_progress"}
@@ -1410,6 +1431,61 @@ def init_board():
         conn.execute("UPDATE proposals SET approval_state = 'rejected', approval_updated_at = COALESCE(NULLIF(approval_updated_at,''), updated_at, created_at, ?) WHERE lower(COALESCE(status,'')) = 'rejected' AND lower(COALESCE(approval_state,'')) NOT IN ('applied')", (utc_now(),))
         conn.execute("UPDATE proposals SET approval_state = 'not_requested' WHERE COALESCE(NULLIF(approval_state,''), '') = ''")
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS adaptation_executions (
+          id TEXT PRIMARY KEY,
+          proposal_id TEXT NOT NULL,
+          source_task_id TEXT NOT NULL,
+          source_run_id TEXT NOT NULL DEFAULT '',
+          source_memory_id TEXT NOT NULL DEFAULT '',
+          proposal_title_snapshot TEXT NOT NULL DEFAULT '',
+          approval_state_snapshot TEXT NOT NULL DEFAULT '',
+          adaptation_type TEXT NOT NULL DEFAULT 'other',
+          execution_status TEXT NOT NULL DEFAULT 'pending_apply',
+          execution_summary TEXT NOT NULL DEFAULT '',
+          execution_note TEXT NOT NULL DEFAULT '',
+          operator_note TEXT NOT NULL DEFAULT '',
+          outcome_text TEXT NOT NULL DEFAULT '',
+          change_target TEXT NOT NULL DEFAULT '',
+          target_scope TEXT NOT NULL DEFAULT '',
+          created_by TEXT NOT NULL DEFAULT 'operator',
+          applied_by TEXT NOT NULL DEFAULT 'operator',
+          rollback_state TEXT NOT NULL DEFAULT '',
+          rollback_note TEXT NOT NULL DEFAULT '',
+          started_at TEXT NOT NULL DEFAULT '',
+          finished_at TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY (proposal_id) REFERENCES proposals(id) ON DELETE CASCADE,
+          FOREIGN KEY (source_task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        )
+        """)
+        adaptation_columns = {row['name'] for row in conn.execute("PRAGMA table_info(adaptation_executions)").fetchall()}
+        adaptation_alters = {
+            'proposal_title_snapshot': "ALTER TABLE adaptation_executions ADD COLUMN proposal_title_snapshot TEXT NOT NULL DEFAULT ''",
+            'approval_state_snapshot': "ALTER TABLE adaptation_executions ADD COLUMN approval_state_snapshot TEXT NOT NULL DEFAULT ''",
+            'adaptation_type': "ALTER TABLE adaptation_executions ADD COLUMN adaptation_type TEXT NOT NULL DEFAULT 'other'",
+            'execution_status': "ALTER TABLE adaptation_executions ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'pending_apply'",
+            'execution_summary': "ALTER TABLE adaptation_executions ADD COLUMN execution_summary TEXT NOT NULL DEFAULT ''",
+            'execution_note': "ALTER TABLE adaptation_executions ADD COLUMN execution_note TEXT NOT NULL DEFAULT ''",
+            'operator_note': "ALTER TABLE adaptation_executions ADD COLUMN operator_note TEXT NOT NULL DEFAULT ''",
+            'outcome_text': "ALTER TABLE adaptation_executions ADD COLUMN outcome_text TEXT NOT NULL DEFAULT ''",
+            'change_target': "ALTER TABLE adaptation_executions ADD COLUMN change_target TEXT NOT NULL DEFAULT ''",
+            'target_scope': "ALTER TABLE adaptation_executions ADD COLUMN target_scope TEXT NOT NULL DEFAULT ''",
+            'created_by': "ALTER TABLE adaptation_executions ADD COLUMN created_by TEXT NOT NULL DEFAULT 'operator'",
+            'applied_by': "ALTER TABLE adaptation_executions ADD COLUMN applied_by TEXT NOT NULL DEFAULT 'operator'",
+            'rollback_state': "ALTER TABLE adaptation_executions ADD COLUMN rollback_state TEXT NOT NULL DEFAULT ''",
+            'rollback_note': "ALTER TABLE adaptation_executions ADD COLUMN rollback_note TEXT NOT NULL DEFAULT ''",
+            'started_at': "ALTER TABLE adaptation_executions ADD COLUMN started_at TEXT NOT NULL DEFAULT ''",
+            'finished_at': "ALTER TABLE adaptation_executions ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''",
+        }
+        for column_name, alter_sql in adaptation_alters.items():
+            if column_name not in adaptation_columns:
+                conn.execute(alter_sql)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptation_executions_proposal ON adaptation_executions(proposal_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptation_executions_task ON adaptation_executions(source_task_id, updated_at DESC, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_adaptation_executions_status ON adaptation_executions(execution_status, updated_at DESC, created_at DESC)")
+
         if 'status' in task_columns:
 
             conn.execute("UPDATE tasks SET status = 'backlog' WHERE LOWER(COALESCE(status,'')) = 'pending'")
@@ -1502,6 +1578,14 @@ def normalize_approval_state(value) -> str:
         return 'not_requested'
     state = APPROVAL_STATE_ALIASES.get(raw, raw)
     return state if state in APPROVAL_STATES else 'not_requested'
+
+
+def normalize_adaptation_execution_status(value) -> str:
+    raw = str(value or '').strip().lower().replace(' ', '_').replace('-', '_')
+    if not raw:
+        return 'pending_apply'
+    state = ADAPTATION_EXECUTION_STATUS_ALIASES.get(raw, raw)
+    return state if state in ADAPTATION_EXECUTION_STATUSES else 'pending_apply'
 
 
 def parse_task_dependency_ids(value) -> list[str]:
@@ -1649,6 +1733,11 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     item['pendingApprovalCount'] = item['pending_approval_count']
     item['approved_proposal_count'] = task_approved_proposal_count(conn, item['id'])
     item['approvedProposalCount'] = item['approved_proposal_count']
+    item['adaptation_count'] = task_adaptation_count(conn, item['id'])
+    item['adaptationCount'] = item['adaptation_count']
+    latest_adaptation = task_latest_adaptation(conn, item['id'])
+    item['latest_adaptation'] = latest_adaptation
+    item['latestAdaptation'] = latest_adaptation
     return item
 
 
@@ -1719,6 +1808,142 @@ def task_approved_proposal_count(conn: sqlite3.Connection, task_id: str) -> int:
     return int((row['count'] if row else 0) or 0)
 
 
+def task_adaptation_count(conn: sqlite3.Connection, task_id: str) -> int:
+    if not task_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) AS count FROM adaptation_executions WHERE source_task_id = ?", (task_id,)).fetchone()
+    return int((row['count'] if row else 0) or 0)
+
+
+def task_latest_adaptation(conn: sqlite3.Connection, task_id: str) -> dict | None:
+    if not task_id:
+        return None
+    row = conn.execute("SELECT * FROM adaptation_executions WHERE source_task_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+    return normalize_adaptation_execution_row(row, conn) if row is not None else None
+
+
+def normalize_adaptation_execution_row(row, conn: sqlite3.Connection | None = None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    item['id'] = str(item.get('id') or '')
+    item['proposal_id'] = str(item.get('proposal_id') or '')
+    item['source_task_id'] = str(item.get('source_task_id') or '')
+    item['source_run_id'] = str(item.get('source_run_id') or '')
+    item['source_memory_id'] = str(item.get('source_memory_id') or '')
+    item['proposal_title_snapshot'] = str(item.get('proposal_title_snapshot') or '')
+    item['approval_state_snapshot'] = normalize_approval_state(item.get('approval_state_snapshot') or 'not_requested')
+    item['adaptation_type'] = str(item.get('adaptation_type') or 'other')
+    item['execution_status'] = normalize_adaptation_execution_status(item.get('execution_status') or 'pending_apply')
+    item['execution_summary'] = str(item.get('execution_summary') or '')
+    item['execution_note'] = str(item.get('execution_note') or '')
+    item['operator_note'] = str(item.get('operator_note') or '')
+    item['outcome_text'] = str(item.get('outcome_text') or '')
+    item['change_target'] = str(item.get('change_target') or '')
+    item['target_scope'] = str(item.get('target_scope') or '')
+    item['created_by'] = str(item.get('created_by') or 'operator')
+    item['applied_by'] = str(item.get('applied_by') or item['created_by'] or 'operator')
+    item['rollback_state'] = str(item.get('rollback_state') or '')
+    item['rollback_note'] = str(item.get('rollback_note') or '')
+    item['started_at'] = str(item.get('started_at') or '')
+    item['finished_at'] = str(item.get('finished_at') or '')
+    item['created_at'] = str(item.get('created_at') or '')
+    item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
+    item['proposalId'] = item['proposal_id']
+    item['sourceTaskId'] = item['source_task_id']
+    item['sourceRunId'] = item['source_run_id']
+    item['sourceMemoryId'] = item['source_memory_id']
+    item['proposalTitleSnapshot'] = item['proposal_title_snapshot']
+    item['approvalStateSnapshot'] = item['approval_state_snapshot']
+    item['adaptationType'] = item['adaptation_type']
+    item['executionStatus'] = item['execution_status']
+    item['executionSummary'] = item['execution_summary']
+    item['executionNote'] = item['execution_note']
+    item['operatorNote'] = item['operator_note']
+    item['outcomeText'] = item['outcome_text']
+    item['changeTarget'] = item['change_target']
+    item['targetScope'] = item['target_scope']
+    item['createdBy'] = item['created_by']
+    item['appliedBy'] = item['applied_by']
+    item['rollbackState'] = item['rollback_state']
+    item['rollbackNote'] = item['rollback_note']
+    item['startedAt'] = item['started_at']
+    item['finishedAt'] = item['finished_at']
+    item['createdAt'] = item['created_at']
+    item['updatedAt'] = item['updated_at']
+    item['proposal'] = None
+    item['source_task'] = None
+    item['source_run'] = None
+    item['source_memory'] = None
+    if conn is not None and item['proposal_id']:
+        proposal_row = conn.execute("SELECT * FROM proposals WHERE id = ?", (item['proposal_id'],)).fetchone()
+        if proposal_row is not None:
+            proposal_item = dict(proposal_row)
+            item['proposal'] = {
+                'id': str(proposal_item.get('id') or ''),
+                'title': str(proposal_item.get('title') or ''),
+                'status': normalize_proposal_status(proposal_item.get('status') or 'proposed'),
+                'approval_state': normalize_approval_state(proposal_item.get('approval_state') or 'not_requested'),
+                'adaptation_type': str(proposal_item.get('adaptation_type') or ''),
+                'source_task_id': str(proposal_item.get('source_task_id') or ''),
+                'updated_at': str(proposal_item.get('updated_at') or proposal_item.get('created_at') or ''),
+            }
+    if conn is not None and item['source_task_id']:
+        item['source_task'] = task_parent_summary(conn, item['source_task_id'])
+    if conn is not None and item['source_run_id']:
+        run_row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (item['source_run_id'],)).fetchone()
+        if run_row is not None:
+            run = normalize_run_row(run_row)
+            item['source_run'] = {'id': str(run.get('id') or ''), 'status': str(run.get('display_status') or run.get('status') or ''), 'title': str(run.get('title') or ''), 'summary': str(run.get('summary') or ''), 'task_id': str(run.get('linked_task_id') or run.get('task_id') or ''), 'updated_at': str(run.get('updated_at') or run.get('finished_at') or run.get('started_at') or run.get('created_at') or '')}
+    if conn is not None and item['source_memory_id']:
+        memory_row = conn.execute("SELECT * FROM vault_records WHERE id = ?", (item['source_memory_id'],)).fetchone()
+        if memory_row is not None:
+            item['source_memory'] = normalize_vault_record_row(memory_row, conn)
+    if conn is not None:
+        adaptations = proposal_adaptations_list(conn, item['id'])
+        item['linked_adaptations'] = adaptations
+        item['linkedAdaptations'] = adaptations
+        item['adaptation_count'] = len(adaptations)
+        item['adaptationCount'] = len(adaptations)
+        item['latest_adaptation'] = adaptations[0] if adaptations else None
+        item['latestAdaptation'] = adaptations[0] if adaptations else None
+    return item
+
+
+def task_adaptations_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    if not task_id:
+        return []
+    rows = conn.execute("SELECT * FROM adaptation_executions WHERE source_task_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC", (task_id,)).fetchall()
+    return [normalize_adaptation_execution_row(row, conn) for row in rows if row is not None]
+
+
+def task_adaptations_get(task_id: str):
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise ResourceNotFoundError('task', task_id)
+        task = normalize_task_row(task_row, conn)
+        adaptations = task_adaptations_list(conn, task_id)
+        return {'task': task, 'adaptations': adaptations, 'adaptation_count': len(adaptations), 'latest_adaptation': adaptations[0] if adaptations else None}
+
+
+def proposal_adaptations_list(conn: sqlite3.Connection, proposal_id: str) -> list[dict]:
+    if not proposal_id:
+        return []
+    rows = conn.execute("SELECT * FROM adaptation_executions WHERE proposal_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC", (proposal_id,)).fetchall()
+    return [normalize_adaptation_execution_row(row, conn) for row in rows if row is not None]
+
+
+def proposal_adaptations_get(proposal_id: str):
+    with connect_board() as conn:
+        proposal_row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+        if proposal_row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(proposal_row, conn)
+        adaptations = proposal_adaptations_list(conn, proposal_id)
+        return {'proposal': proposal, 'adaptations': adaptations, 'adaptation_count': len(adaptations), 'latest_adaptation': adaptations[0] if adaptations else None}
+
+
 def task_memories_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
     if not task_id:
         return []
@@ -1743,7 +1968,7 @@ def task_memories_get(task_id: str):
             raise KeyError('task not found')
         task = normalize_task_row(row, conn)
         memories = task_memories_list(conn, task_id)
-        return {'task_id': task_id, 'task_title': task.get('title') or '', 'memories': memories, 'memory_count': len(memories)}
+        return {'task_id': task_id, 'task_title': task.get('title') or '', 'memories': memories, 'memory_count': len(memories), 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
 
 
 def vault_record_get(vault_id: str):
@@ -1873,7 +2098,7 @@ def task_proposals_get(task_id: str):
             raise KeyError('task not found')
         task = normalize_task_row(row, conn)
         proposals = task_proposals_list(conn, task_id)
-        return {'task_id': task_id, 'task_title': task.get('title') or '', 'proposals': proposals, 'proposal_count': len(proposals)}
+        return {'task_id': task_id, 'task_title': task.get('title') or '', 'proposals': proposals, 'proposal_count': len(proposals), 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
 
 
 def proposal_record_get(proposal_id: str):
@@ -2253,16 +2478,232 @@ def proposal_apply(proposal_id: str, payload: dict | None = None) -> dict:
             raise ResourceNotFoundError('proposal', proposal_id)
         if proposal.get('approval_state') not in ('approved', 'applied'):
             raise ValueError('proposal must be approved before it can be applied')
-    update_payload = {
-        '_governance_action': True,
-        'status': 'applied',
-        'approval_state': 'applied',
-        'approval_note': str(payload.get('approval_note', payload.get('note', proposal.get('approval_note') or '')) or '').strip(),
-        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
-        'adaptation_type': str(payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or '')) or '').strip(),
-        'source_task_id': proposal.get('source_task_id') or '',
-    }
-    return proposal_record_update(proposal_id, update_payload)
+        existing_rows = conn.execute("SELECT * FROM adaptation_executions WHERE proposal_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC", (proposal_id,)).fetchall()
+        existing = [normalize_adaptation_execution_row(item, conn) for item in existing_rows if item is not None]
+    if existing:
+        latest = existing[0]
+        if latest.get('execution_status') in ('pending_apply', 'applying'):
+            return {'proposal': proposal, 'adaptation': latest}
+    created = adaptation_execution_create({'proposal_id': proposal_id, 'source_task_id': proposal.get('source_task_id') or '', 'source_run_id': payload.get('source_run_id', payload.get('sourceRunId', proposal.get('source_run_id') or '')), 'source_memory_id': payload.get('source_memory_id', payload.get('sourceMemoryId', proposal.get('source_memory_id') or '')), 'adaptation_type': payload.get('adaptation_type', payload.get('adaptationType', proposal.get('adaptation_type') or proposal.get('proposal_type') or 'other')), 'execution_status': 'pending_apply', 'execution_summary': payload.get('execution_summary', payload.get('executionSummary', '')), 'execution_note': payload.get('execution_note', payload.get('executionNote', payload.get('note', proposal.get('approval_note') or ''))), 'operator_note': payload.get('operator_note', payload.get('operatorNote', '')), 'outcome_text': payload.get('outcome_text', payload.get('outcomeText', '')), 'change_target': payload.get('change_target', payload.get('changeTarget', proposal.get('adaptation_type') or proposal.get('proposal_type') or 'operator-workflow')), 'target_scope': payload.get('target_scope', payload.get('targetScope', 'task_workspace')), 'approval_state_snapshot': proposal.get('approval_state') or 'approved', 'proposal_title_snapshot': proposal.get('title') or '', 'created_by': payload.get('created_by', payload.get('createdBy', payload.get('operator', proposal.get('reviewed_by') or 'operator'))), 'applied_by': payload.get('applied_by', payload.get('appliedBy', payload.get('operator', proposal.get('reviewed_by') or 'operator')))})
+    return {'proposal': proposal, 'adaptation': created.get('adaptation')}
+
+
+def adaptation_execution_get(adaptation_id: str) -> dict:
+    if not adaptation_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute("SELECT * FROM adaptation_executions WHERE id = ?", (adaptation_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('adaptation', adaptation_id)
+        adaptation = normalize_adaptation_execution_row(row, conn)
+        return {'adaptation': adaptation}
+
+
+def adaptation_execution_list(query: str = '', task_id: str = '', proposal_id: str = '', status: str = '') -> dict:
+    with connect_board() as conn:
+        where = []
+        params: list[str] = []
+        clean_query = str(query or '').strip().lower()
+        clean_task_id = str(task_id or '').strip()
+        clean_proposal_id = str(proposal_id or '').strip()
+        clean_status = normalize_adaptation_execution_status(status or '') if str(status or '').strip() else ''
+        if clean_task_id:
+            where.append('source_task_id = ?')
+            params.append(clean_task_id)
+        if clean_proposal_id:
+            where.append('proposal_id = ?')
+            params.append(clean_proposal_id)
+        if clean_status:
+            where.append('execution_status = ?')
+            params.append(clean_status)
+        if clean_query:
+            where.append('(lower(proposal_title_snapshot) LIKE ? OR lower(execution_summary) LIKE ? OR lower(execution_note) LIKE ? OR lower(outcome_text) LIKE ? OR lower(change_target) LIKE ?)')
+            needle = f'%{clean_query}%'
+            params.extend([needle, needle, needle, needle, needle])
+        sql = 'SELECT * FROM adaptation_executions'
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY updated_at DESC, created_at DESC, id DESC'
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        adaptations = [normalize_adaptation_execution_row(row, conn) for row in rows if row is not None]
+        return {'adaptations': adaptations, 'count': len(adaptations), 'query': clean_query, 'source_task_id': clean_task_id, 'proposal_id': clean_proposal_id, 'status': clean_status}
+
+
+def adaptation_execution_create(payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    proposal_id = str(payload.get('proposal_id', payload.get('proposalId', '')) or '').strip()
+    source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
+    source_run_id = str(payload.get('source_run_id', payload.get('run_id', payload.get('sourceRunId', payload.get('runId', '')))) or '').strip()
+    source_memory_id = str(payload.get('source_memory_id', payload.get('memory_id', payload.get('sourceMemoryId', payload.get('memoryId', '')))) or '').strip()
+    adaptation_type = str(payload.get('adaptation_type', payload.get('adaptationType', 'other')) or 'other').strip() or 'other'
+    execution_status = normalize_adaptation_execution_status(payload.get('execution_status', payload.get('executionStatus', 'pending_apply')))
+    execution_summary = str(payload.get('execution_summary', payload.get('executionSummary', '')) or '').strip()
+    execution_note = str(payload.get('execution_note', payload.get('executionNote', payload.get('note', ''))) or '').strip()
+    operator_note = str(payload.get('operator_note', payload.get('operatorNote', execution_note)) or '').strip()
+    outcome_text = str(payload.get('outcome_text', payload.get('outcomeText', '')) or '').strip()
+    change_target = str(payload.get('change_target', payload.get('changeTarget', adaptation_type)) or '').strip()
+    target_scope = str(payload.get('target_scope', payload.get('targetScope', 'task_workspace')) or 'task_workspace').strip() or 'task_workspace'
+    created_by = str(payload.get('created_by', payload.get('createdBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator'
+    applied_by = str(payload.get('applied_by', payload.get('appliedBy', payload.get('operator', created_by))) or created_by).strip() or created_by
+    rollback_state = str(payload.get('rollback_state', payload.get('rollbackState', '')) or '').strip()
+    rollback_note = str(payload.get('rollback_note', payload.get('rollbackNote', '')) or '').strip()
+    approval_state_snapshot = normalize_approval_state(payload.get('approval_state_snapshot', payload.get('approvalStateSnapshot', 'approved')))
+    proposal_title_snapshot = str(payload.get('proposal_title_snapshot', payload.get('proposalTitleSnapshot', '')) or '').strip()
+    if not proposal_id:
+        raise ValueError('proposal_id is required')
+    if not source_task_id:
+        raise ValueError('source_task_id is required')
+    with connect_board() as conn:
+        proposal_row = conn.execute('SELECT * FROM proposals WHERE id = ?', (proposal_id,)).fetchone()
+        if proposal_row is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        proposal = normalize_proposal_row(proposal_row, conn)
+        if proposal is None:
+            raise ResourceNotFoundError('proposal', proposal_id)
+        if proposal.get('approval_state') not in ('approved', 'applied'):
+            raise ValueError('proposal must be approved before an adaptation execution can be created')
+        if str(proposal.get('source_task_id') or '') != source_task_id:
+            raise ValueError('proposal_id is linked to a different task')
+        task_row = conn.execute(TASK_SELECT + ' WHERE t.id = ?', (source_task_id,)).fetchone()
+        if task_row is None:
+            raise ResourceNotFoundError('task', source_task_id)
+        task = normalize_task_row(task_row, conn)
+        if source_run_id:
+            run_row = conn.execute(RUN_SELECT + ' WHERE r.id = ?', (source_run_id,)).fetchone()
+            if run_row is None:
+                raise ValueError('source_run_id does not match an existing run')
+        if source_memory_id:
+            memory_row = conn.execute('SELECT * FROM vault_records WHERE id = ?', (source_memory_id,)).fetchone()
+            if memory_row is None:
+                raise ValueError('source_memory_id does not match an existing memory record')
+        now = utc_now()
+        started_at = now if execution_status in ('applying', 'applied', 'failed', 'rolled_back') else ''
+        finished_at = now if execution_status in ('applied', 'failed', 'rolled_back') else ''
+        item = {
+            'id': uuid.uuid4().hex,
+            'proposal_id': proposal_id,
+            'source_task_id': source_task_id,
+            'source_run_id': source_run_id,
+            'source_memory_id': source_memory_id,
+            'proposal_title_snapshot': proposal_title_snapshot or str(proposal.get('title') or ''),
+            'approval_state_snapshot': approval_state_snapshot or normalize_approval_state(proposal.get('approval_state') or 'approved'),
+            'adaptation_type': adaptation_type,
+            'execution_status': execution_status,
+            'execution_summary': execution_summary,
+            'execution_note': execution_note,
+            'operator_note': operator_note,
+            'outcome_text': outcome_text,
+            'change_target': change_target,
+            'target_scope': target_scope,
+            'created_by': created_by,
+            'applied_by': applied_by,
+            'rollback_state': rollback_state,
+            'rollback_note': rollback_note,
+            'started_at': started_at,
+            'finished_at': finished_at,
+            'created_at': now,
+            'updated_at': now,
+        }
+        conn.execute(
+            '''
+            INSERT INTO adaptation_executions (
+              id, proposal_id, source_task_id, source_run_id, source_memory_id, proposal_title_snapshot, approval_state_snapshot, adaptation_type, execution_status, execution_summary, execution_note, operator_note, outcome_text, change_target, target_scope, created_by, applied_by, rollback_state, rollback_note, started_at, finished_at, created_at, updated_at
+            ) VALUES (
+              :id, :proposal_id, :source_task_id, :source_run_id, :source_memory_id, :proposal_title_snapshot, :approval_state_snapshot, :adaptation_type, :execution_status, :execution_summary, :execution_note, :operator_note, :outcome_text, :change_target, :target_scope, :created_by, :applied_by, :rollback_state, :rollback_note, :started_at, :finished_at, :created_at, :updated_at
+            )
+            ''',
+            item,
+        )
+        task_event_create(conn, source_task_id, 'adaptation_apply_started', f"Adaptation execution created for proposal: {item['proposal_title_snapshot']}.", note=execution_note or execution_summary, metadata={'adaptation_id': item['id'], 'proposal_id': proposal_id, 'execution_status': execution_status, 'change_target': change_target, 'target_scope': target_scope}, created_at=now)
+        conn.commit()
+        adaptation = normalize_adaptation_execution_row(item, conn)
+        return {'adaptation': adaptation, 'proposal': proposal, 'task': task}
+
+
+def adaptation_execution_update(adaptation_id: str, payload: dict | None = None) -> dict:
+    payload = dict(payload or {})
+    if not adaptation_id:
+        raise ValueError('id is required')
+    with connect_board() as conn:
+        row = conn.execute('SELECT * FROM adaptation_executions WHERE id = ?', (adaptation_id,)).fetchone()
+        if row is None:
+            raise ResourceNotFoundError('adaptation', adaptation_id)
+        existing = normalize_adaptation_execution_row(row, conn)
+        source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', existing.get('source_task_id') or '')))) or str(existing.get('source_task_id') or '')
+        if source_task_id != str(existing.get('source_task_id') or ''):
+            raise ValueError('source_task_id cannot be changed for an adaptation execution')
+        execution_status = normalize_adaptation_execution_status(payload.get('execution_status', payload.get('executionStatus', existing.get('execution_status') or 'pending_apply')))
+        execution_summary = str(payload.get('execution_summary', payload.get('executionSummary', existing.get('execution_summary') or '')) or '').strip()
+        execution_note = str(payload.get('execution_note', payload.get('executionNote', existing.get('execution_note') or '')) or '').strip()
+        operator_note = str(payload.get('operator_note', payload.get('operatorNote', execution_note or existing.get('operator_note') or '')) or '').strip()
+        outcome_text = str(payload.get('outcome_text', payload.get('outcomeText', existing.get('outcome_text') or '')) or '').strip()
+        change_target = str(payload.get('change_target', payload.get('changeTarget', existing.get('change_target') or '')) or '').strip()
+        target_scope = str(payload.get('target_scope', payload.get('targetScope', existing.get('target_scope') or 'task_workspace')) or 'task_workspace').strip() or 'task_workspace'
+        applied_by = str(payload.get('applied_by', payload.get('appliedBy', existing.get('applied_by') or existing.get('created_by') or 'operator')) or existing.get('applied_by') or existing.get('created_by') or 'operator').strip() or 'operator'
+        rollback_state = str(payload.get('rollback_state', payload.get('rollbackState', existing.get('rollback_state') or '')) or '').strip()
+        rollback_note = str(payload.get('rollback_note', payload.get('rollbackNote', existing.get('rollback_note') or '')) or '').strip()
+        started_at = str(existing.get('started_at') or '')
+        finished_at = str(existing.get('finished_at') or '')
+        now = utc_now()
+        if execution_status in ('applying', 'applied', 'failed', 'rolled_back') and not started_at:
+            started_at = now
+        if execution_status in ('applied', 'failed', 'rolled_back'):
+            finished_at = now
+        update_item = {
+            'id': adaptation_id,
+            'execution_status': execution_status,
+            'execution_summary': execution_summary,
+            'execution_note': execution_note,
+            'operator_note': operator_note,
+            'outcome_text': outcome_text,
+            'change_target': change_target,
+            'target_scope': target_scope,
+            'applied_by': applied_by,
+            'rollback_state': rollback_state,
+            'rollback_note': rollback_note,
+            'started_at': started_at,
+            'finished_at': finished_at,
+            'updated_at': now,
+        }
+        conn.execute(
+            '''
+            UPDATE adaptation_executions
+            SET execution_status = :execution_status,
+                execution_summary = :execution_summary,
+                execution_note = :execution_note,
+                operator_note = :operator_note,
+                outcome_text = :outcome_text,
+                change_target = :change_target,
+                target_scope = :target_scope,
+                applied_by = :applied_by,
+                rollback_state = :rollback_state,
+                rollback_note = :rollback_note,
+                started_at = :started_at,
+                finished_at = :finished_at,
+                updated_at = :updated_at
+            WHERE id = :id
+            ''',
+            update_item,
+        )
+        event_type = 'adaptation_execution_note_saved'
+        detail = f"Adaptation execution note saved for proposal: {existing.get('proposal_title_snapshot') or existing.get('proposal_id')}."
+        if execution_status == 'applying':
+            event_type = 'adaptation_apply_started'
+            detail = f"Adaptation apply started: {existing.get('proposal_title_snapshot') or existing.get('proposal_id')}."
+        elif execution_status == 'applied':
+            event_type = 'adaptation_apply_succeeded'
+            detail = f"Adaptation applied successfully: {existing.get('proposal_title_snapshot') or existing.get('proposal_id')}."
+        elif execution_status == 'failed':
+            event_type = 'adaptation_apply_failed'
+            detail = f"Adaptation marked failed: {existing.get('proposal_title_snapshot') or existing.get('proposal_id')}."
+        elif execution_status == 'rolled_back':
+            event_type = 'adaptation_rollback_marked'
+            detail = f"Adaptation rolled back: {existing.get('proposal_title_snapshot') or existing.get('proposal_id')}."
+        task_event_create(conn, source_task_id, event_type, detail, note=execution_note or outcome_text or rollback_note, metadata={'adaptation_id': adaptation_id, 'proposal_id': existing.get('proposal_id') or '', 'execution_status': execution_status, 'change_target': change_target, 'target_scope': target_scope, 'rollback_state': rollback_state}, created_at=now)
+        conn.commit()
+        updated_row = conn.execute('SELECT * FROM adaptation_executions WHERE id = ?', (adaptation_id,)).fetchone()
+        adaptation = normalize_adaptation_execution_row(updated_row, conn)
+        return {'adaptation': adaptation}
 
 
 def vault_record_create(payload: dict | None = None) -> dict:
@@ -2503,7 +2944,7 @@ def task_get(task_id: str):
         task['linkedProposals'] = linked_proposals
         task['proposal_count'] = len(linked_proposals)
         task['proposalCount'] = len(linked_proposals)
-        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals)}
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals), 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
 
 
 def task_history_get(task_id: str):
@@ -6663,10 +7104,13 @@ class Handler(BaseHTTPRequestHandler):
         task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
         task_memories_match = re.fullmatch(r"/api/tasks/([^/]+)/memories", parsed.path)
         task_proposals_match = re.fullmatch(r"/api/tasks/([^/]+)/proposals", parsed.path)
+        task_adaptations_match = re.fullmatch(r"/api/tasks/([^/]+)/adaptations", parsed.path)
         task_children_match = re.fullmatch(r"/api/tasks/([^/]+)/children", parsed.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
         vault_match = re.fullmatch(r"/api/vault/([^/]+)", parsed.path)
+        proposal_adaptations_match = re.fullmatch(r"/api/proposals/([^/]+)/(?:adaptations|applications)", parsed.path)
         proposal_match = re.fullmatch(r"/api/proposals/([^/]+)", parsed.path)
+        adaptation_match = re.fullmatch(r"/api/adaptations/([^/]+)", parsed.path)
         task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         task_attachment_content_match = re.fullmatch(r"/api/task-attachments/([^/]+)/content", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
@@ -6686,6 +7130,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/proposals":
             qs = parse_qs(parsed.query)
             self.send_json(proposal_records_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], run_id=(qs.get('run_id') or qs.get('source_run_id') or [''])[0], memory_id=(qs.get('memory_id') or qs.get('source_memory_id') or [''])[0], status=(qs.get('status') or [''])[0], approval_state=(qs.get('approval_state') or qs.get('approvalState') or [''])[0]))
+            return
+        if parsed.path == "/api/adaptations":
+            qs = parse_qs(parsed.query)
+            self.send_json(adaptation_execution_list(query=(qs.get('q') or [''])[0], task_id=(qs.get('task_id') or qs.get('source_task_id') or [''])[0], proposal_id=(qs.get('proposal_id') or [''])[0], status=(qs.get('status') or [''])[0]))
             return
         if task_history_match:
             try:
@@ -6710,6 +7158,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(task_proposals_get(task_proposals_match.group(1)))
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='task_proposals_failed', fallback_code='task_proposals_failed')
+            return
+        if task_adaptations_match:
+            try:
+                self.send_json(task_adaptations_get(task_adaptations_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='task_adaptations_failed', fallback_code='task_adaptations_failed')
             return
         if task_children_match:
             try:
@@ -6795,11 +7249,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='vault_detail_failed', fallback_code='vault_detail_failed')
             return
+        if proposal_adaptations_match:
+            try:
+                self.send_json(proposal_adaptations_get(proposal_adaptations_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='proposal_adaptations_failed', fallback_code='proposal_adaptations_failed')
+            return
         if proposal_match:
             try:
                 self.send_json(proposal_record_get(proposal_match.group(1)))
             except Exception as exc:
                 self.send_api_error(exc, fallback_boundary='proposal_detail_failed', fallback_code='proposal_detail_failed')
+            return
+        if adaptation_match:
+            try:
+                self.send_json(adaptation_execution_get(adaptation_match.group(1)))
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='adaptation_detail_failed', fallback_code='adaptation_detail_failed')
             return
         if parsed.path == "/api/library":
             self.send_json(library_list())
@@ -6865,8 +7331,12 @@ class Handler(BaseHTTPRequestHandler):
             proposal_approve_match = re.fullmatch(r"/api/proposals/([^/]+)/approve", parsed.path)
             proposal_reject_match = re.fullmatch(r"/api/proposals/([^/]+)/reject", parsed.path)
             proposal_apply_match = re.fullmatch(r"/api/proposals/([^/]+)/apply", parsed.path)
+            adaptation_update_match = re.fullmatch(r"/api/adaptations/update", parsed.path)
             if parsed.path == "/api/proposals":
                 self.send_json(proposal_record_create(payload), 201)
+                return
+            if parsed.path == "/api/adaptations":
+                self.send_json(adaptation_execution_create(payload), 201)
                 return
             if approval_request_match:
                 self.send_json(proposal_request_approval(approval_request_match.group(1), payload))
@@ -6879,6 +7349,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if proposal_apply_match:
                 self.send_json(proposal_apply(proposal_apply_match.group(1), payload))
+                return
+            if adaptation_update_match:
+                adaptation_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
+                self.send_json(adaptation_execution_update(adaptation_id, payload))
                 return
             if parsed.path == "/api/tasks/update":
                 task_id = (qs.get("id") or [""])[0] or str((payload or {}).get('id') or '')
