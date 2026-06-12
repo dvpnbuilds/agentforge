@@ -563,8 +563,13 @@
     const RUN_STATUS_ORDER=['running','queued','failed','cancelled','completed'];
     const ACTIVE_RUN_STATUSES=['queued','running'];
     const AGENT_PILL_COLORS={master:'#3B82F6',assistant:'#22D3EE',research:'#22C55E',planning:'#F59E0B',audit:'#EC4899',dev:'#8B5CF6'};
+    const DEPLOYMENT_STATUS_META={draft:{label:'Draft',color:'#F59E0B'},ready:{label:'Ready',color:'#22C55E'},inactive:{label:'Inactive',color:'#94A3B8'}};
+    const DEPLOYMENT_TYPE_LABELS={hermes_profile:'Hermes Profile',docker:'Docker',compose:'Docker Compose',systemd:'Systemd',vercel:'Vercel',worker:'Worker',local_process:'Local Process'};
+    const DEPLOYMENT_TRIGGER_LABELS={manual:'Manual',task_driven:'Task Driven',schedule:'Schedule',webhook:'Webhook'};
     const truncate=(value,max=120)=>{const text=String(value||'').trim();return text.length>max?`${text.slice(0,Math.max(0,max-1)).trimEnd()}…`:text};
     const formatTaskTime=value=>{if(!value)return'—';const d=new Date(value);return Number.isNaN(d.getTime())?String(value):d.toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})};
+    const formatDeploymentType=value=>{const clean=String(value||'').trim();return DEPLOYMENT_TYPE_LABELS[clean]||clean.replace(/_/g,' ').replace(/\b\w/g,ch=>ch.toUpperCase())||'Unknown'};
+    const formatTriggerMode=value=>{const clean=String(value||'').trim();return DEPLOYMENT_TRIGGER_LABELS[clean]||clean.replace(/_/g,' ').replace(/\b\w/g,ch=>ch.toUpperCase())||'Unknown'};
     const runSortStamp=run=>Date.parse(run&&run.started_at||run&&run.finished_at||run&&run.updated_at||run&&run.created_at||'')||0;
     const formatRunSummaryHint=run=>truncate(run&&run.summary||run&&run.result_text||run&&run.log_preview||'No execution summary yet.',120);
     const normalizeTaskHistoryEvent=event=>({id:Number(event&&event.id||0),task_id:String(event&&event.task_id||''),event_type:String(event&&event.event_type||''),message:String(event&&event.message||''),note:String(event&&event.note||''),created_at:String(event&&event.created_at||event&&event.createdAt||''),metadata:event&&typeof event.metadata==='object'&&event.metadata?event.metadata:{}});
@@ -648,50 +653,66 @@
     function KanbanTab(){
       const state=useKanbanData();
       const tasks=state.tasks||[];
-      return h('div',{className:'mx-auto max-w-[1680px] space-y-6'},
-        h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-7 shadow-[0_30px_80px_rgba(15,23,42,.08)] backdrop-blur-xl'},
+      const [viewMode,setViewMode]=useState('list');
+      const total=tasks.length;
+      const assigned=tasks.filter(task=>task.agent_id).length;
+      const reviewLoop=tasks.filter(task=>['review','revision_requested'].includes(task.status)).length;
+      const completed=tasks.filter(task=>task.status==='completed').length;
+      const selectedTaskLabel=state.selectedTask&&state.selectedTask.title?truncate(state.selectedTask.title,42):'No task selected';
+      return h('div',{className:'mx-auto max-w-[1640px] space-y-5'},
+        h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-6 shadow-[0_24px_70px_rgba(15,23,42,.08)] backdrop-blur-xl'},
           h('div',{className:'flex flex-wrap items-start justify-between gap-4'},
             h('div',{className:'max-w-3xl'},
               h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.24em] text-slate-400'},'TASKS'),
-              h('h2',{className:'mt-2 text-[38px] font-semibold tracking-[-.04em] text-slate-950'},'Task Operations'),
-              h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},'Create work, inspect it fast, move it through lifecycle, and keep operator context attached to the same task record.')
+              h('h2',{className:'mt-1 text-[32px] font-semibold tracking-[-.04em] text-slate-950'},'Task Operations'),
+              h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},'Primary queue surface for creating work, scanning status, and opening one shared task workspace.')
             ),
-            h('button',{onClick:()=>state.setCreateOpen(true),className:'rounded-2xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-[0_16px_40px_rgba(15,23,42,.18)] transition hover:-translate-y-px'},'New Task')
+            h('div',{className:'flex flex-wrap items-center gap-3'},
+              h('div',{className:'inline-flex rounded-2xl border border-white/60 bg-white/80 p-1 shadow-sm'},
+                h(ViewModeButton,{label:'List',active:viewMode==='list',onClick:()=>setViewMode('list')}),
+                h(ViewModeButton,{label:'Board',active:viewMode==='board',onClick:()=>setViewMode('board')})
+              ),
+              h('button',{onClick:()=>state.setCreateOpen(true),className:'rounded-2xl bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-[0_16px_40px_rgba(15,23,42,.18)] transition hover:-translate-y-px'},'New Task')
+            )
           ),
-          h('div',{className:'mt-5 grid gap-3 sm:grid-cols-4'},
-            h(TaskSummaryCard,{label:'Total Tasks',value:tasks.length,color:'#22D3EE'}),
-            h(TaskSummaryCard,{label:'Assigned',value:tasks.filter(task=>task.agent_id).length,color:'#8B5CF6'}),
-            h(TaskSummaryCard,{label:'In Review Loop',value:tasks.filter(task=>['review','revision_requested'].includes(task.status)).length,color:'#EC4899'}),
-            h(TaskSummaryCard,{label:'Completed',value:tasks.filter(task=>task.status==='completed').length,color:'#10B981'})
+          h('div',{className:'mt-4 grid gap-3 lg:grid-cols-[minmax(0,1.25fr)_repeat(4,minmax(0,150px))]'},
+            h('div',{className:'rounded-[22px] border border-white/50 bg-white/80 px-4 py-4 shadow-sm'},
+              h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},'WORKSPACE STATE'),
+              h('div',{className:'mt-2 flex flex-wrap items-center gap-2'},
+                h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50 px-3 py-1 text-[11px] font-semibold text-cyan-700'},viewMode==='list'?'List view active':'Board view active'),
+                h('span',{className:'rounded-full border border-white/60 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},selectedTaskLabel)
+              ),
+              h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},viewMode==='list'?'Use the list for tighter scan order. Open any row to reuse the same workspace on the right.':'Use the board for queue-stage triage. Opening a card lands in the same workspace on the right.'),
+            ),
+            h(TaskSummaryCard,{label:'Total',value:total,color:'#22D3EE'}),
+            h(TaskSummaryCard,{label:'Assigned',value:assigned,color:'#8B5CF6'}),
+            h(TaskSummaryCard,{label:'Review',value:reviewLoop,color:'#EC4899'}),
+            h(TaskSummaryCard,{label:'Done',value:completed,color:'#10B981'})
           ),
           state.toast&&h('div',{className:'mt-4 rounded-2xl border border-cyan-100 bg-cyan-50/80 px-4 py-3 text-sm text-cyan-700'},state.toast),
           state.loading&&h('div',{className:'mt-3 text-xs text-slate-400'},'Syncing tasks…')
         ),
         state.createOpen&&h(TaskCreatePanel,{agents:state.agents,playbooks:state.playbooks,onCancel:()=>state.setCreateOpen(false),onSubmit:payload=>state.createTask(payload)}),
-        h('section',{className:'grid gap-6 xl:grid-cols-[minmax(0,1fr)_460px] xl:items-start'},
-          h('div',{className:'space-y-6'},
-            h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-6 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
-              h('div',{className:'mb-4'},
-                h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'TASK LIST'),
-                h('h3',{className:'mt-1 text-2xl font-semibold tracking-[-.03em] text-slate-950'},'All Tasks'),
-                h('p',{className:'mt-1 text-sm text-slate-500'},'Click any task to inspect the same record without leaving the board.')
+        h('section',{className:'grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px] xl:items-start'},
+          h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-5 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
+            h('div',{className:'mb-4 flex flex-wrap items-start justify-between gap-3'},
+              h('div',{className:'max-w-2xl'},
+                h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},viewMode==='list'?'TASK LIST':'STATUS BOARD'),
+                h('h3',{className:'mt-1 text-2xl font-semibold tracking-[-.03em] text-slate-950'},viewMode==='list'?'Queue List':'Queue Board'),
+                h('p',{className:'mt-1 text-sm text-slate-500'},viewMode==='list'?'Tighter scan surface for the full queue. Select any row to open the same task workspace.':'Stage-based scan surface using the same underlying task model and the same task workspace.')
               ),
-              h(TaskList,{tasks,selectedTaskId:state.selectedTaskId,onSelect:state.openTask})
+              h('div',{className:'rounded-2xl border border-white/55 bg-white/80 px-3 py-2 text-xs font-semibold text-slate-500'},`${num(total)} task${total===1?'':'s'} visible`)
             ),
-            h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-6 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
-              h('div',{className:'mb-4'},
-                h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'BASIC KANBAN'),
-                h('h3',{className:'mt-1 text-2xl font-semibold tracking-[-.03em] text-slate-950'},'Status Board'),
-                h('p',{className:'mt-1 text-sm text-slate-500'},'List and board stay in sync because both read from the same task model.')
-              ),
-              h(BasicKanbanBoard,{tasks,selectedTaskId:state.selectedTaskId,onSelect:state.openTask})
-            )
+            viewMode==='list'
+              ? h(TaskList,{tasks,selectedTaskId:state.selectedTaskId,onSelect:state.openTask})
+              : h(BasicKanbanBoard,{tasks,selectedTaskId:state.selectedTaskId,onSelect:state.openTask})
           ),
           h(TaskInspector,{task:state.selectedTask,agents:state.agents,playbooks:state.playbooks,loading:state.inspectorLoading,busy:state.inspectorBusy,onClose:state.closeInspector,onOpenTask:state.openTask,onSave:(taskId,payload,label)=>state.updateTask(taskId,payload,label),onStartRun:(taskId,payload)=>state.startRun(taskId,payload),onUpdateRun:(runId,payload,label)=>state.updateRun(runId,payload,label),onCreateMemory:(payload,label)=>state.createMemory(payload,label),onCreateProposal:(payload,label)=>state.createProposal(payload,label),onGenerateProposal:(taskId,payload,label)=>state.generateProposal(taskId,payload,label),onUpdateProposal:(proposalId,payload,label)=>state.updateProposal(proposalId,payload,label),onCreateAdaptation:(payload,label)=>state.createAdaptation(payload,label),onUpdateAdaptation:(adaptationId,payload,label)=>state.updateAdaptation(adaptationId,payload,label),onProposalAction:(proposalId,action,payload,label)=>state.proposalAction(proposalId,action,payload,label)})
         )
       )
     }
-    function TaskSummaryCard({label,value,color}){return h('div',{className:'rounded-[22px] border border-white/45 bg-white/70 px-4 py-4 text-center shadow-sm'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},label),h(CountUp,{value,className:'mt-2 text-3xl font-semibold',style:{color}}))}
+    function ViewModeButton({label,active,onClick}){return h('button',{type:'button',onClick,className:`rounded-[14px] px-3 py-2 text-xs font-semibold transition ${active?'bg-slate-950 text-white shadow-sm':'text-slate-600 hover:bg-white'}`},label)}
+    function TaskSummaryCard({label,value,color}){return h('div',{className:'rounded-[20px] border border-white/45 bg-white/78 px-3 py-3 text-center shadow-sm'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},label),h(CountUp,{value,className:'mt-1 text-[28px] font-semibold',style:{color}}))}
     function TaskCreatePanel({agents,playbooks,onCancel,onSubmit}){
       const [draft,setDraft]=useState(emptyTaskDraft());
       const [error,setError]=useState('');
@@ -744,9 +765,9 @@
       )
     }
     function SimpleTaskFormSection({title,control}){return h('section',{className:'rounded-[24px] border border-white/45 bg-white/40 p-5 shadow-sm'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},title),control)}
-    function TaskList({tasks,selectedTaskId,onSelect}){return tasks.length?h('div',{className:'space-y-3'},tasks.map(task=>h(TaskListRow,{key:task.id,task,selected:task.id===selectedTaskId,onSelect}))):h('div',{className:'rounded-[22px] border border-dashed border-white/60 bg-white/35 px-4 py-10 text-center text-sm text-slate-400'},'No tasks yet. Create the first one from New Task.')}
-    function TaskListRow({task,selected,onSelect}){const meta=TASK_STATUS_META[task.status]||TASK_STATUS_META.backlog;const agentColor=AGENT_PILL_COLORS[String(task.assigned_agent_name||'').toLowerCase()]||'#64748B';return h('button',{type:'button',onClick:()=>onSelect&&onSelect(task.id),className:`w-full rounded-[22px] border p-4 text-left shadow-sm transition hover:-translate-y-px ${selected?'border-cyan-300 bg-cyan-50/80 ring-2 ring-cyan-200/60':'border-white/45 bg-white/75'}`},h('div',{className:'flex flex-wrap items-start justify-between gap-3'},h('div',{className:'min-w-0 flex-1'},h('h4',{className:'text-[16px] font-semibold tracking-[-.02em] text-slate-900'},task.title||'Untitled task'),h('p',{className:'mt-1 text-sm leading-6 text-slate-600'},truncate(task.instruction||task.description,180))),h('span',{className:'rounded-full px-3 py-1 text-[11px] font-semibold',style:{color:meta.color,background:`${meta.color}16`}},meta.label)),h('div',{className:'mt-3 flex flex-wrap gap-2'},h('span',{className:'rounded-full px-2.5 py-1 text-[11px] font-semibold',style:{color:agentColor,background:`${agentColor}16`}},task.assigned_agent_name||'Unassigned'),task.parent_task&&h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50/90 px-2.5 py-1 text-[11px] font-semibold text-cyan-700'},`Child of ${truncate(task.parent_task.title,22)}`),task.child_count>0&&h('span',{className:'rounded-full border border-indigo-100 bg-indigo-50/90 px-2.5 py-1 text-[11px] font-semibold text-indigo-700'},`${task.child_count} child${task.child_count===1?'':'ren'}`),task.linked_playbook_name&&h('span',{className:'rounded-full border border-violet-100 bg-violet-50/90 px-2.5 py-1 text-[11px] font-semibold text-violet-700'},task.linked_playbook_name),task.result_text&&h('span',{className:'rounded-full border border-emerald-100 bg-emerald-50/90 px-2.5 py-1 text-[11px] font-semibold text-emerald-700'},'Result saved')))}
-    function BasicKanbanBoard({tasks,selectedTaskId,onSelect}){return h('div',{className:'overflow-x-auto'},h('div',{className:'flex min-w-max gap-4'},TASK_COLUMN_META.map(column=>h(TaskBoardColumn,{key:column.key,column,tasks:tasks.filter(task=>task.status===column.key),selectedTaskId,onSelect}))))}
+    function TaskList({tasks,selectedTaskId,onSelect}){return tasks.length?h('div',{className:'space-y-2.5'},tasks.map(task=>h(TaskListRow,{key:task.id,task,selected:task.id===selectedTaskId,onSelect}))):h('div',{className:'rounded-[22px] border border-dashed border-white/60 bg-white/35 px-4 py-10 text-center text-sm text-slate-400'},'No tasks yet. Create the first one from New Task.')}
+    function TaskListRow({task,selected,onSelect}){const meta=TASK_STATUS_META[task.status]||TASK_STATUS_META.backlog;const agentColor=AGENT_PILL_COLORS[String(task.assigned_agent_name||'').toLowerCase()]||'#64748B';return h('button',{type:'button',onClick:()=>onSelect&&onSelect(task.id),className:`w-full rounded-[20px] border px-4 py-3 text-left shadow-sm transition hover:-translate-y-px ${selected?'border-cyan-300 bg-cyan-50/80 ring-2 ring-cyan-200/60':'border-white/45 bg-white/78 hover:bg-white/90'}`},h('div',{className:'flex flex-wrap items-start justify-between gap-3'},h('div',{className:'min-w-0 flex-1'},h('div',{className:'flex flex-wrap items-center gap-2'},h('h4',{className:'text-[15px] font-semibold tracking-[-.02em] text-slate-900'},task.title||'Untitled task'),task.updated_at&&h('span',{className:'text-[11px] font-medium text-slate-400'},`Updated ${formatTaskTime(task.updated_at)}`)),h('p',{className:'mt-1 text-[13px] leading-6 text-slate-600'},truncate(task.instruction||task.description,124))),h('span',{className:'rounded-full px-3 py-1 text-[11px] font-semibold',style:{color:meta.color,background:`${meta.color}16`}},meta.label)),h('div',{className:'mt-3 flex flex-wrap gap-2'},h('span',{className:'rounded-full px-2.5 py-1 text-[11px] font-semibold',style:{color:agentColor,background:`${agentColor}16`}},task.assigned_agent_name||'Unassigned'),task.parent_task&&h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50/90 px-2.5 py-1 text-[11px] font-semibold text-cyan-700'},`Child of ${truncate(task.parent_task.title,22)}`),task.child_count>0&&h('span',{className:'rounded-full border border-indigo-100 bg-indigo-50/90 px-2.5 py-1 text-[11px] font-semibold text-indigo-700'},`${task.child_count} child${task.child_count===1?'':'ren'}`),task.linked_playbook_name&&h('span',{className:'rounded-full border border-violet-100 bg-violet-50/90 px-2.5 py-1 text-[11px] font-semibold text-violet-700'},truncate(task.linked_playbook_name,26)),task.result_text&&h('span',{className:'rounded-full border border-emerald-100 bg-emerald-50/90 px-2.5 py-1 text-[11px] font-semibold text-emerald-700'},'Result saved')))}
+    function BasicKanbanBoard({tasks,selectedTaskId,onSelect}){return h('div',{className:'overflow-x-auto pb-1'},h('div',{className:'flex min-w-max gap-4'},TASK_COLUMN_META.map(column=>h(TaskBoardColumn,{key:column.key,column,tasks:tasks.filter(task=>task.status===column.key),selectedTaskId,onSelect}))))}
     function TaskBoardColumn({column,tasks,selectedTaskId,onSelect}){return h('div',{className:'min-w-[260px] max-w-[260px] rounded-[24px] border border-white/45 bg-[rgba(244,247,251,.88)] p-4 shadow-sm'},h('div',{className:'flex items-start justify-between gap-3'},h('div',null,h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em]',style:{color:column.color}},column.label),h('p',{className:'mt-1 text-[12px] leading-5 text-slate-500'},column.description)),h('span',{className:'rounded-full px-2.5 py-1 text-[11px] font-semibold',style:{color:column.color,background:`${column.color}16`}},tasks.length)),h('div',{className:'mt-4 space-y-3 min-h-[120px]'},tasks.length?tasks.map(task=>h(TaskBoardCard,{key:task.id,task,selected:task.id===selectedTaskId,onSelect})):h('div',{className:'rounded-[18px] border border-dashed border-slate-300/80 bg-white/55 px-4 py-6 text-center text-[12px] text-slate-400'},'No tasks here.')))}
     function TaskBoardCard({task,selected,onSelect}){const meta=TASK_STATUS_META[task.status]||TASK_STATUS_META.backlog;const agentColor=AGENT_PILL_COLORS[String(task.assigned_agent_name||'').toLowerCase()]||'#64748B';return h('button',{type:'button',onClick:()=>onSelect&&onSelect(task.id),className:`w-full rounded-[18px] border p-3 text-left shadow-sm transition hover:-translate-y-px ${selected?'border-cyan-300 bg-cyan-50/85 ring-2 ring-cyan-200/60':'border-white/65 bg-white/90'}`},h('div',{className:'text-[14px] font-semibold leading-5 text-slate-900'},task.title||'Untitled task'),h('p',{className:'mt-1 text-[12px] leading-5 text-slate-600'},truncate(task.instruction||task.description,110)),h('div',{className:'mt-3 flex flex-wrap gap-2'},h('span',{className:'rounded-full px-2 py-1 text-[10px] font-semibold',style:{color:agentColor,background:`${agentColor}16`}},task.assigned_agent_name||'Unassigned'),task.parent_task&&h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50/90 px-2 py-1 text-[10px] font-semibold text-cyan-700'},'Child'),task.child_count>0&&h('span',{className:'rounded-full border border-indigo-100 bg-indigo-50/90 px-2 py-1 text-[10px] font-semibold text-indigo-700'},`${task.child_count} child${task.child_count===1?'':'ren'}`),task.linked_playbook_name&&h('span',{className:'rounded-full border border-violet-100 bg-violet-50/90 px-2 py-1 text-[10px] font-semibold text-violet-700'},truncate(task.linked_playbook_name,22)),h('span',{className:'rounded-full px-2 py-1 text-[10px] font-semibold',style:{color:meta.color,background:`${meta.color}16`}},meta.label)))}
     function TaskInspector({task,agents,playbooks,loading,busy,onClose,onOpenTask,onSave,onStartRun,onUpdateRun,onCreateMemory,onCreateProposal,onGenerateProposal,onUpdateProposal,onCreateAdaptation,onUpdateAdaptation,onProposalAction}){
@@ -840,7 +861,7 @@
         setAdaptationChangeTarget(activeAdaptation&&activeAdaptation.change_target||selected&&selected.adaptation_type||'');
         setAdaptationTargetScope(activeAdaptation&&activeAdaptation.target_scope||'task_workspace');
       },[selectedProposalId,task&&task.updated_at]);
-      if(!task)return h('aside',{className:'rounded-[28px] border border-white/40 bg-white/60 p-6 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl xl:sticky xl:top-6'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'TASK WORKSPACE'),h('h3',{className:'mt-2 text-2xl font-semibold tracking-[-.03em] text-slate-950'},loading?'Loading task…':'No task selected'),h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},loading?'Loading task workspace state…':'Open a task from the list or Kanban to stay inside one shared workspace for notes, output, history, and execution context.'));
+      if(!task)return h('aside',{className:'rounded-[24px] border border-white/35 bg-white/52 p-5 shadow-[0_18px_50px_rgba(15,23,42,.07)] backdrop-blur-xl xl:sticky xl:top-6'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'TASK WORKSPACE'),h('h3',{className:'mt-2 text-xl font-semibold tracking-[-.03em] text-slate-900'},loading?'Loading task…':'Select a task'),h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},loading?'Loading task workspace state…':'Pick a row or card to open task details, output, audit state, memory, and history in one quieter side workspace.'),h('div',{className:'mt-4 rounded-[20px] border border-dashed border-white/60 bg-white/55 px-4 py-4'},h('div',{className:'flex flex-wrap gap-2'},h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50 px-3 py-1 text-[11px] font-semibold text-cyan-700'},'Open from list'),h('span',{className:'rounded-full border border-violet-100 bg-violet-50 px-3 py-1 text-[11px] font-semibold text-violet-700'},'Open from board'),h('span',{className:'rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold text-slate-600'},'Same task record'))));
       const history=Array.isArray(task&&task.history)?task.history:[];
       const taskRuns=Array.isArray(task&&task.runs)?task.runs:[];
       const latestRun=task&&task.latest_run||null;
@@ -1337,6 +1358,89 @@
     function CleanupButton({label,onClick,tone='slate',disabled}){const palette=tone==='red'?{bg:'bg-rose-600 text-white',border:'border-rose-500'}:tone==='rose'?{bg:'bg-rose-50 text-rose-700',border:'border-rose-200'}:tone==='amber'?{bg:'bg-amber-50 text-amber-700',border:'border-amber-200'}:{bg:'bg-slate-50 text-slate-700',border:'border-slate-200'};return h('button',{type:'button',disabled:!!disabled,onClick, className:`rounded-2xl border px-3 py-2 text-xs font-semibold transition ${palette.bg} ${palette.border} ${disabled?'cursor-not-allowed opacity-40':'hover:-translate-y-px'}`},label)}
     const RUN_SEMANTIC_TONES={user:'border-slate-200 bg-slate-50 text-slate-700',system:'border-amber-200 bg-amber-50 text-amber-700',verification:'border-rose-200 bg-rose-50 text-rose-700',runtime:'border-cyan-200 bg-cyan-50 text-cyan-700',deployment:'border-violet-200 bg-violet-50 text-violet-700',task:'border-emerald-200 bg-emerald-50 text-emerald-700'};
     function RunSemanticChip({label,tone='system'}){if(!label)return null;const style=RUN_SEMANTIC_TONES[tone]||RUN_SEMANTIC_TONES.system;return h('span',{className:`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${style}`},label)}
+
+    function useDeploymentsData(){
+      const [deployments,setDeployments]=useState([]),[loading,setLoading]=useState(true),[selectedId,setSelectedId]=useState(''),[toast,setToast]=useState('');
+      const load=()=>fetch('/api/deployments',{headers:{Accept:'application/json'}}).then(async r=>{const body=await r.json().catch(()=>({}));if(!r.ok)throw new Error(body.error||'Deployment fetch failed');const rows=Array.isArray(body.deployments)?body.deployments:[];setDeployments(rows);setSelectedId(prev=>prev&&rows.some(item=>item.id===prev)?prev:(rows[0]&&rows[0].id||''));setLoading(false);return rows;}).catch(err=>{setToast(err&&err.message?err.message:'Deployment fetch failed');setLoading(false);throw err});
+      useEffect(()=>{load().catch(()=>{})},[]);
+      useEffect(()=>{if(!toast)return;const t=setTimeout(()=>setToast(''),3200);return()=>clearTimeout(t)},[toast]);
+      const selected=deployments.find(item=>item.id===selectedId)||deployments[0]||null;
+      return{deployments,loading,selected,selectedId,setSelectedId,toast,reload:load};
+    }
+    function DeploymentsTab(){
+      const state=useDeploymentsData();
+      const deployments=state.deployments||[];
+      const readyCount=deployments.filter(item=>item.status==='ready').length;
+      const draftCount=deployments.filter(item=>item.status==='draft').length;
+      const inactiveCount=deployments.filter(item=>item.status==='inactive').length;
+      return h('div',{className:'deployments-tab mx-auto max-w-[1540px] space-y-6'},
+        h('section',{className:'relative overflow-hidden rounded-[28px] border border-white/40 bg-white/65 p-7 shadow-[0_30px_80px_rgba(15,23,42,.08)] backdrop-blur-xl'},
+          h('div',{className:'pointer-events-none absolute -right-20 -top-24 h-80 w-80 rounded-full bg-violet-300/22 blur-3xl'}),
+          h('div',{className:'pointer-events-none absolute left-1/3 bottom-0 h-64 w-64 rounded-full bg-cyan-300/18 blur-3xl'}),
+          h('div',{className:'relative z-[1] flex flex-wrap items-end justify-between gap-6'},
+            h('div',{className:'max-w-3xl'},
+              h('div',{className:'font-mono text-xs font-bold tracking-[.28em] text-slate-400'},'DEPLOYMENTS'),
+              h('h2',{className:'mt-2 font-medium tracking-[-.03em] text-slate-950',style:{fontSize:'clamp(40px,5vw,60px)',lineHeight:.96}},'Deployment Registry'),
+              h('p',{className:'mt-3 text-base text-slate-500'},'Live deployment mappings for registered agents. This tab now renders from /api/deployments instead of calling a missing component.')
+            ),
+            h('div',{className:'grid min-w-[280px] gap-3 sm:grid-cols-2'},
+              h(LibraryInsight,{label:'Mapped',value:deployments.length,color:'#22D3EE'}),
+              h(LibraryInsight,{label:'Ready',value:readyCount,color:'#22C55E'}),
+              h(LibraryInsight,{label:'Draft',value:draftCount,color:'#F59E0B'}),
+              h(LibraryInsight,{label:'Inactive',value:inactiveCount,color:'#94A3B8'})
+            )
+          ),
+          state.toast&&h('div',{className:'relative z-[1] mt-4 rounded-2xl border border-cyan-100 bg-cyan-50/80 px-4 py-3 text-sm text-cyan-700'},state.toast),
+          state.loading&&h('div',{className:'relative z-[1] mt-3 text-xs text-slate-400'},'Syncing deployments…')
+        ),
+        h('section',{className:'grid gap-6 xl:grid-cols-[minmax(0,1fr)_390px] xl:items-start'},
+          h('section',{className:'rounded-[28px] border border-white/40 bg-white/65 p-6 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl'},
+            h('div',{className:'mb-4'},
+              h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'DEPLOYMENT LIST'),
+              h('h3',{className:'mt-1 text-2xl font-semibold tracking-[-.03em] text-slate-950'},'Mapped Targets'),
+              h('p',{className:'mt-1 text-sm text-slate-500'},'Stable read-only surface for now. Select a mapped target to inspect deployment metadata without risking a crash.')
+            ),
+            deployments.length
+              ? h('div',{className:'space-y-3'},deployments.map(item=>h(DeploymentRow,{key:item.id,item,selected:item.id===state.selectedId,onSelect:()=>state.setSelectedId(item.id)})))
+              : h('div',{className:'rounded-[22px] border border-dashed border-white/60 bg-white/35 px-4 py-10 text-center text-sm text-slate-400'},state.loading?'Loading deployments…':'No deployments mapped yet.')
+          ),
+          h(DeploymentInspector,{item:state.selected,loading:state.loading})
+        )
+      )
+    }
+    function DeploymentStatusPill({status}){const meta=DEPLOYMENT_STATUS_META[String(status||'').toLowerCase()]||{label:String(status||'Unknown')||'Unknown',color:'#94A3B8'};return h('span',{className:'rounded-full px-3 py-1 text-[11px] font-semibold',style:{color:meta.color,background:`${meta.color}16`}},meta.label)}
+    function DeploymentRow({item,selected,onSelect}){return h('button',{type:'button',onClick:onSelect,className:`w-full rounded-[22px] border p-4 text-left shadow-sm transition hover:-translate-y-px ${selected?'border-cyan-300 bg-cyan-50/80 ring-2 ring-cyan-200/60':'border-white/45 bg-white/75 hover:bg-white/90'}`},h('div',{className:'flex flex-wrap items-start justify-between gap-3'},h('div',{className:'min-w-0 flex-1'},h('div',{className:'flex flex-wrap items-center gap-2'},h('h4',{className:'text-[16px] font-semibold tracking-[-.02em] text-slate-900'},item.agent_name||'Unassigned agent'),h('span',{className:'text-[11px] font-medium text-slate-400'},formatTaskTime(item.updated_at||item.created_at))),h('p',{className:'mt-1 text-sm leading-6 text-slate-600'},item.target||'No deployment target set')),h(DeploymentStatusPill,{status:item.status})),h('div',{className:'mt-3 flex flex-wrap gap-2'},h('span',{className:'rounded-full border border-violet-100 bg-violet-50/90 px-2.5 py-1 text-[11px] font-semibold text-violet-700'},formatDeploymentType(item.deployment_type)),h('span',{className:'rounded-full border border-cyan-100 bg-cyan-50/90 px-2.5 py-1 text-[11px] font-semibold text-cyan-700'},formatTriggerMode(item.trigger_mode)),item.playbook_name&&h('span',{className:'rounded-full border border-indigo-100 bg-indigo-50/90 px-2.5 py-1 text-[11px] font-semibold text-indigo-700'},truncate(item.playbook_name,26)),item.agent_status&&h('span',{className:'rounded-full border border-slate-200 bg-white/90 px-2.5 py-1 text-[11px] font-semibold text-slate-600'},`Agent ${item.agent_status}`)))}
+    function DeploymentInspector({item,loading}){if(!item)return h('aside',{className:'rounded-[24px] border border-white/35 bg-white/52 p-5 shadow-[0_18px_50px_rgba(15,23,42,.07)] backdrop-blur-xl xl:sticky xl:top-6'},h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'DEPLOYMENT DETAIL'),h('h3',{className:'mt-2 text-xl font-semibold tracking-[-.03em] text-slate-900'},loading?'Loading deployment…':'No deployment selected'),h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},'Choose a deployment mapping from the list to inspect its target, trigger mode, notes, and linked agent metadata.'));
+      return h('aside',{className:'rounded-[28px] border border-white/40 bg-white/65 p-6 shadow-[0_20px_60px_rgba(15,23,42,.08)] backdrop-blur-xl xl:sticky xl:top-6'},
+        h('div',{className:'flex flex-wrap items-start justify-between gap-3'},
+          h('div',{className:'min-w-0'},
+            h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.22em] text-slate-400'},'DEPLOYMENT DETAIL'),
+            h('h3',{className:'mt-2 text-2xl font-semibold tracking-[-.03em] text-slate-950'},item.agent_name||'Mapped deployment'),
+            h('p',{className:'mt-2 text-sm leading-6 text-slate-500'},item.target||'No deployment target set.')
+          ),
+          h(DeploymentStatusPill,{status:item.status})
+        ),
+        h('div',{className:'mt-4 grid gap-3 sm:grid-cols-2'},
+          h(TaskMetaField,{label:'Deployment Type',value:formatDeploymentType(item.deployment_type)}),
+          h(TaskMetaField,{label:'Trigger Mode',value:formatTriggerMode(item.trigger_mode)}),
+          h(TaskMetaField,{label:'Agent Status',value:item.agent_status||'Unknown'}),
+          h(TaskMetaField,{label:'Playbook',value:item.playbook_name||'None linked'}),
+          h(TaskMetaField,{label:'Last Checked',value:formatTaskTime(item.last_checked_at)}),
+          h(TaskMetaField,{label:'Updated',value:formatTaskTime(item.updated_at||item.created_at)})
+        ),
+        h('section',{className:'mt-4 rounded-[22px] border border-white/45 bg-white/75 p-4 shadow-sm'},
+          h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},'NOTES'),
+          h('p',{className:'mt-2 text-sm leading-6 text-slate-600'},item.notes||'No deployment notes saved yet.')
+        ),
+        h('section',{className:'mt-4 rounded-[22px] border border-white/45 bg-white/75 p-4 shadow-sm'},
+          h('div',{className:'font-mono text-[10px] font-bold uppercase tracking-[.18em] text-slate-400'},'RECORD IDS'),
+          h('div',{className:'mt-3 grid gap-3'},
+            h(TaskMetaField,{label:'Deployment ID',value:item.id||'—'}),
+            h(TaskMetaField,{label:'Agent ID',value:item.agent_id||'—'})
+          )
+        )
+      )
+    }
     function RunsConfirmDialog({state,inputValue,onInput,onCancel,onConfirm,busy}){
       if(!state)return null;
       const requiresPhrase=!!state.requiresPhrase;
