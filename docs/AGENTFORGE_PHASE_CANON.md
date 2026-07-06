@@ -1,6 +1,6 @@
 # AgentForge Phase Canon
 
-Last updated: 2026-06-12
+Last updated: 2026-07-06
 Purpose: continuity anchor for AgentForge whenever chat context drifts, compression fails, or DEV/PLANNING/AUDIT need one trusted source.
 
 ---
@@ -8,6 +8,12 @@ Purpose: continuity anchor for AgentForge whenever chat context drifts, compress
 ## 1) Product canon
 
 AgentForge is a **task-centered workforce OS**.
+
+Primary product goal:
+- make tasks actually finishable inside AgentForge
+- each task should be able to produce the **right output**, not just hold notes or status
+- each task should also surface **useful suggestions/proposals** that improve the work, the output, or the next step
+- the app should help the operator go from task intake -> execution -> output -> review -> suggestion -> approval -> applied improvement inside one shared workflow
 
 Main mental model:
 - Tasks is the entry point
@@ -55,10 +61,16 @@ AI audit + human review + revision loop.
 Save reusable outputs, lessons, and approved work.
 
 ### Phase 9 — Proposals
-System-generated improvement suggestions.
+System-generated improvement suggestions tied to task context, saved memory, and prior outputs.
 
 ### Phase 10 — Approval-governed adaptation
 Safe learning with human approval for structural changes.
+
+### Phase 11 — Output intelligence
+Strengthen output generation so task deliverables are context-aware, usable, and close to the right final answer.
+
+### Phase 12 — Functional completion loop
+Make the full task loop reliable: task in -> strong output out -> smart suggestions visible -> operator can approve and improve the system from the same workspace.
 
 ---
 
@@ -490,8 +502,8 @@ Deferred:
 - autonomous approval or apply behavior
 
 Next recommended phase:
-- Implementation Phase 17 — Vault Intelligence V1
-- generated proposals now exist, but the biggest quality gap is richer retrieval and synthesis from accumulated vault memory so future suggestions are driven by stronger reusable knowledge instead of only recent task-local context
+- Implementation Phase 17 — Task Output Flow V1
+- generated proposals now exist, but the next highest-value gap is making task deliverables durable, reusable, and visible inside the shared workspace instead of leaving output as shallow task-local text
 
 ### Implementation Phase 17 — Task Output Flow V1
 Status: confirmed complete
@@ -534,22 +546,104 @@ Next recommended phase:
 - Implementation Phase 18 — Vault Intelligence V1
 - durable task outputs now exist as reusable artifacts; the next highest-value gap is stronger retrieval/synthesis across vault memory and saved task artifacts so future proposal/output quality can draw from more than local task context
 
+### Implementation Phase 18 — Vault Intelligence V1
+Status: reported complete / handoff ready
+Date: 2026-06-26
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+
+What shipped:
+- ranked task-context retrieval now surfaces relevant vault memories and relevant saved outputs on the shared task record
+- task detail/workspace payloads now carry `relevant_memories`, `relevant_outputs`, and `relevant_context_summary`
+- output generation and proposal generation now both use ranked vault/output context instead of only shallow task-local context
+- the shared task workspace now exposes a compact Relevant Context surface so operators can see reusable lessons and reference outputs from the same task flow
+
+Routes / data changes:
+- additive task detail fields: `relevant_memories`, `relevant_outputs`, `relevant_context_summary`
+- additive retrieval helpers: ranked vault-memory lookup and ranked saved-output lookup by task context
+- output generation path now defaults to `generation_source='heuristic_task_output_vault_intelligence_v1'`
+- proposal generation path now defaults to `generation_source='heuristic_task_context_vault_intelligence_v1'`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke on isolated live app `http://127.0.0.1:50001` confirmed task detail payload carries relevant context fields, ranked memory retrieval works, ranked saved-output retrieval works, output generation uses vault-intelligence metadata, and proposal generation uses vault-intelligence metadata
+- browser QA on `http://127.0.0.1:50001` confirmed Tasks workspace shows Relevant Context, ranked memory/output content is visible, and the same shared task record remains usable across list/board flow
+- at the time of this handoff, the primary app on `http://127.0.0.1:50000` still needed reload/restart before Phase 18 could be claimed live on the main port; this was later resolved in the Phase 19 closeout pass
+
+Deferred:
+- stronger ranking/model-backed retrieval beyond heuristic V1 matching
+- explicit operator quality loop for marking whether the generated output was actually correct/useful
+- main-port reload/restart was still pending at this Phase 18 handoff; resolved later in the Phase 19 closeout pass
+
+Next recommended phase:
+- Implementation Phase 19 — Functional Completion Loop V1
+- Phase 18 improved context quality for outputs and suggestions; the next gap was letting the operator close the loop on whether the output was right, whether the suggestion helped, and whether the task was actually done from the same workspace
+
+### Implementation Phase 19 — Functional Completion Loop V1
+Status: confirmed complete on main port during stabilization / closeout pass
+Date: 2026-07-06
+
+Changed files:
+- `/root/agentforge/index.html`
+- `/root/agentforge/server.py`
+- `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/README.md`
+
+What shipped:
+- saved task outputs now carry explicit review state, review note, reviewer metadata, and optional linked proposal context
+- the shared task workspace now separates `artifact saved` from `task complete` through a small operator-facing completion loop
+- operators can mark the latest output as `needs_revision`, `usable`, or `approved` before completing the task
+- task detail payloads now expose `completion_state`, `latest_output_review_status`, and `can_complete_from_workspace` so the UI and API agree on finishability
+- the main-port runtime now exposes `GET /api/status` for lightweight truth checks
+- this closeout pass also removed ambiguity around old side verification servers after confirming the real app should live on `127.0.0.1:50000`
+
+Routes / data changes:
+- new route: `GET /api/status`
+- output review route active on main port: `POST /api/task-outputs/:id/review`
+- task completion route active on main port: `POST /api/tasks/:id/complete-from-workspace`
+- additive task fields: `completion_state`, `latest_output_review_status`, `can_complete_from_workspace`
+- additive task output fields: `review_status`, `review_note`, `reviewed_by`, `reviewed_at`, `review_proposal_id`, `review_proposal_title`, `approved_at`, `revision_requested_at`
+
+Verification:
+- `python3 -m py_compile /root/agentforge/server.py`
+- extracted inline JS + `node --check`
+- real API smoke on main port `http://127.0.0.1:50000`: task create -> output generate -> output review (`usable`) -> complete-from-workspace -> task detail confirmed `completed`
+- real HTTP proof on main port for `/` and `/api/status`
+- port audit confirmed `50001` / `50002` were old verification servers and not the primary app; cleanup left the real app on `50000`
+
+Deferred:
+- stronger output quality/ranking beyond heuristic V1 generation
+- tighter proposal-assisted revision flows beyond manual operator control
+- deeper multi-step delegation/adaptation orchestration
+
+Next recommended phase:
+- Implementation Phase 20 — Output Intelligence V2
+- Phase 19 made the completion loop real; the next highest-leverage gap is improving output quality and proposal usefulness so the operator needs less manual cleanup before marking work complete
+
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
 - **foundation is real**
-- **task workspace is real and now includes execution, audit, delegation, memory capture, durable task outputs, manual/generated proposals, approval governance, and applied adaptation execution in one shared flow**
+- **the shared task workspace is real on the main port and now includes execution, audit, delegation, memory capture, durable task outputs, ranked relevant context, proposals, approval governance, applied adaptation execution, and a small operator completion loop**
 - but the full canon product is still not complete
+
+Functional-completion target:
+- AgentForge should feel complete when an operator can open a task, generate the right output with enough context, review suggestions/proposals that meaningfully improve the result or workflow, and close the loop without leaving the shared workspace.
 
 What feels strongest now:
 - task creation
-- Kanban
+- Kanban on the shared task model
 - runs/history visibility
-- run inspector depth
 - task workspace foundation
 - durable task output generation and saved output readback
+- relevant context surfacing inside the shared workspace
+- output review + completion gating on the main port
 - task-level audit workflow
 - manual parent/child delegation inside the task workspace
 - task-linked memory capture and retrieval
@@ -562,8 +656,10 @@ What is still clearly missing from the canon product:
 - deeper Delegation / subtask tree
 - deeper Audit beyond V1
 - deeper task workspace richness beyond V1
-- richer vault intelligence beyond operator-curated V1 capture and saved task artifact reuse
+- deeper vault intelligence beyond heuristic V1 ranking/synthesis
+- stronger output generation quality so the deliverable is closer to the right final answer
 - higher-quality proposal synthesis beyond heuristic V1 generation
+- richer proposal-to-output revision assistance beyond the current manual operator loop
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
 ---
@@ -573,20 +669,22 @@ What is still clearly missing from the canon product:
 Current recommended next implementation phase:
 
 ### Preferred next implementation phase
-**Implementation Phase 18 — Vault Intelligence V1**
+**Implementation Phase 20 — Output Intelligence V2**
 
 Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, durable saved outputs, generated/manual proposal records, approval governance, and real applied execution state
-- Task Output Flow V1 made task deliverables durable and reusable, but proposal/output quality is still bounded by shallow task-local heuristics and weak retrieval over accumulated vault knowledge
-- Vault Intelligence V1 is the best next layer because it would improve both operator recall and proposal quality without jumping prematurely into autonomous multi-step orchestration
+- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, saved outputs, ranked relevant context, generated/manual proposals, approval governance, applied execution state, and a verified completion loop on the main port
+- the biggest remaining operator pain is not the absence of finish-state controls anymore; it is the amount of manual cleanup still needed before an output feels truly strong
+- Output Intelligence V2 is the best next layer because it improves the quality of the artifact and proposal pairing before the operator reaches the Phase 19 completion gate
+- this keeps the roadmap centered on DV's real product goal: tasks that end with the right output plus useful suggestions inside the same workspace
 
-Vault Intelligence V1 should likely add:
-- stronger retrieval and ranking across saved vault records tied to task context
-- reusable memory synthesis or “relevant lessons” surfacing inside the task workspace before proposal generation
-- better context packaging so generated proposals can draw from more than the latest local task note/run/memory snapshot
+Output Intelligence V2 should likely add:
+- stronger output generation quality using better packaging of task, vault, and saved-output context
+- better proposal-to-output linkage so revisions are guided by the most relevant improvement note instead of manual cross-checking
+- clearer output quality signals before the operator reaches final completion
+- quality improvements that stay operator-visible and auditable instead of jumping straight to autonomous mutation
 
 Alternative after that:
-- deeper Delegation V2 or multi-step adaptation orchestration
+- deeper Delegation V2 or Proposal Intelligence V2
 
 ---
 
@@ -653,19 +751,23 @@ Current reality:
 - Runs/history are strong
 - Task Workspace V1 is real
 - Audit V1 is real
-- Delegation V1 is now real
-- Memory Vault V1 is now real
-- Task Output Flow V1 is now real
-- Proposals V1 is now real
-- Approval-Governed Adaptation V1 is now real
-- Applied Adaptation Execution V1 is now real
-- Proposal Automation V1 is now real
+- Delegation V1 is real
+- Memory Vault V1 is real
+- Task Output Flow V1 is real
+- Vault Intelligence V1 is real on the main port
+- Proposals V1 is real
+- Approval-Governed Adaptation V1 is real
+- Applied Adaptation Execution V1 is real
+- Proposal Automation V1 is real
+- Functional Completion Loop V1 is now real on the main port
 
 Main missing product layers:
-- richer vault intelligence beyond curated V1 capture and saved artifact reuse
+- deeper vault intelligence beyond heuristic V1 ranking/synthesis
+- stronger output generation quality so the deliverable is closer to the right final answer
 - higher-quality proposal synthesis beyond heuristic V1 generation
+- richer proposal-to-output revision assistance beyond the current manual operator loop
 - deeper delegation/orchestration depth
 - multi-step adaptation orchestration beyond operator-driven V1 execution
 
-Current best next step after Phase 17:
-- **Implementation Phase 18 — Vault Intelligence V1**
+Current best next step after Phase 19:
+- **Implementation Phase 20 — Output Intelligence V2**

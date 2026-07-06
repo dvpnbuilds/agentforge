@@ -25,6 +25,9 @@ from urllib.parse import parse_qs, urlparse
 
 HOST = "127.0.0.1"
 PORT = 50000
+STALE_RUNNING_RUN_MAX_AGE_SECONDS = 12 * 60 * 60
+APP_NAME = "AgentForge"
+IMPLEMENTATION_PHASE = "Phase 19 stabilization / closeout"
 PROJECT_DIR = Path(__file__).resolve().parent
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/root/.hermes"))
 LIBRARY_ROOT = Path("/root/.hermes/content")
@@ -114,6 +117,13 @@ RUN_TEST_PATTERNS = [
     r"\bverification\b",
     r"\bcleanup after verification\b",
 ]
+VAULT_INTELLIGENCE_STOPWORDS = {
+    'about', 'after', 'again', 'also', 'been', 'before', 'being', 'between', 'both', 'brief', 'build', 'built', 'can',
+    'current', 'deliverable', 'draft', 'each', 'from', 'have', 'into', 'just', 'latest', 'make', 'more', 'most', 'need',
+    'next', 'note', 'only', 'other', 'output', 'over', 'same', 'saved', 'should', 'since', 'some', 'task', 'that', 'their',
+    'them', 'then', 'there', 'these', 'this', 'through', 'using', 'very', 'what', 'when', 'where', 'which', 'while', 'with',
+    'within', 'would', 'your'
+}
 GATEWAY_STATE_PATHS = [
     HERMES_HOME / "gateway_state.json",
     HERMES_HOME / "profiles" / "master" / "gateway_state.json",
@@ -639,6 +649,80 @@ def parse_time_to_epoch(value):
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def stale_running_run_cutoff(now_epoch: float | None = None) -> float:
+    current = float(now_epoch if now_epoch is not None else time.time())
+    return current - STALE_RUNNING_RUN_MAX_AGE_SECONDS
+
+
+def stale_running_run_anchor_epoch(row, *, now_epoch: float | None = None) -> float | None:
+    item = dict(row or {})
+    for key in ("updated_at", "started_at", "created_at"):
+        epoch = parse_time_to_epoch(item.get(key))
+        if epoch is not None:
+            return epoch
+    return now_epoch
+
+
+def stale_running_run_rows(conn: sqlite3.Connection, *, now_epoch: float | None = None) -> list[dict]:
+    current = float(now_epoch if now_epoch is not None else time.time())
+    cutoff = stale_running_run_cutoff(current)
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM runs
+        WHERE lower(COALESCE(status, '')) = 'running'
+          AND COALESCE(NULLIF(finished_at, ''), '') = ''
+        ORDER BY COALESCE(NULLIF(started_at, ''), created_at) ASC, created_at ASC, id ASC
+        """
+    ).fetchall()
+    stale = []
+    for row in rows:
+        anchor = stale_running_run_anchor_epoch(row, now_epoch=current)
+        if anchor is not None and anchor <= cutoff:
+            stale.append(dict(row))
+    return stale
+
+
+def reconcile_stale_running_runs(conn: sqlite3.Connection, *, now_epoch: float | None = None) -> list[dict]:
+    current = float(now_epoch if now_epoch is not None else time.time())
+    stale_rows = stale_running_run_rows(conn, now_epoch=current)
+    reconciled = []
+    for row in stale_rows:
+        run_id = str(row.get('id') or '').strip()
+        if not run_id:
+            continue
+        anchor_epoch = stale_running_run_anchor_epoch(row, now_epoch=current)
+        finished_at = datetime.fromtimestamp(anchor_epoch if anchor_epoch is not None else current, timezone.utc).isoformat()
+        metadata = sanitize_run_metadata(row.get('metadata_json') or {})
+        metadata.update({
+            'reconciled_reason': 'stale_running_timeout',
+            'reconciled_at': utc_now(),
+            'stale_cutoff_hours': str(int(STALE_RUNNING_RUN_MAX_AGE_SECONDS // 3600)),
+        })
+        result = update_run_record(
+            conn,
+            run_id,
+            status='cancelled',
+            finished_at=finished_at,
+            result_label='Cancelled',
+            result_summary=trim_run_text(str(row.get('result_summary') or row.get('summary') or 'Historical running run reconciled after exceeding the stale timeout.'), 220),
+            log_preview=trim_run_text(str(row.get('log_preview') or 'Historical running run reconciled as stale.'), 420),
+            error_message=make_run_error_message(str(row.get('error_message') or 'Run reconciled automatically after exceeding the stale running timeout.')),
+            metadata=metadata,
+        )
+        append_trace_event(
+            conn,
+            run_id,
+            event_type='reconciled',
+            event_label='Stale running run reconciled',
+            event_detail='Run exceeded the stale running timeout and was auto-cancelled during reconciliation.',
+            event_status='skipped',
+            metadata={'reason': 'stale_running_timeout', 'finished_at': finished_at, 'cutoff_hours': str(int(STALE_RUNNING_RUN_MAX_AGE_SECONDS // 3600))},
+        )
+        reconciled.append(result)
+    return reconciled
 
 
 def sessions_data():
@@ -1227,6 +1311,14 @@ def init_board():
               generation_source TEXT DEFAULT '',
               generation_note TEXT DEFAULT '',
               context_summary TEXT DEFAULT '',
+              review_status TEXT DEFAULT 'unreviewed',
+              review_note TEXT DEFAULT '',
+              reviewed_by TEXT DEFAULT 'operator',
+              reviewed_at TEXT DEFAULT '',
+              review_proposal_id TEXT DEFAULT '',
+              review_proposal_title TEXT DEFAULT '',
+              approved_at TEXT DEFAULT '',
+              revision_requested_at TEXT DEFAULT '',
               created_by TEXT DEFAULT 'operator',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -1235,6 +1327,21 @@ def init_board():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_task_id ON task_outputs(source_task_id, updated_at DESC, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_run_id ON task_outputs(source_run_id, updated_at DESC, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_outputs_type ON task_outputs(output_type, updated_at DESC, created_at DESC)")
+        task_output_columns = {row[1] for row in conn.execute("PRAGMA table_info(task_outputs)").fetchall()}
+        task_output_column_defaults = {
+            'review_status': "TEXT DEFAULT 'unreviewed'",
+            'review_note': "TEXT DEFAULT ''",
+            'reviewed_by': "TEXT DEFAULT 'operator'",
+            'reviewed_at': "TEXT DEFAULT ''",
+            'review_proposal_id': "TEXT DEFAULT ''",
+            'review_proposal_title': "TEXT DEFAULT ''",
+            'approved_at': "TEXT DEFAULT ''",
+            'revision_requested_at': "TEXT DEFAULT ''",
+        }
+        for column, ddl in task_output_column_defaults.items():
+            if column not in task_output_columns:
+                conn.execute(f"ALTER TABLE task_outputs ADD COLUMN {column} {ddl}")
+        conn.execute("UPDATE task_outputs SET review_status = 'unreviewed' WHERE COALESCE(NULLIF(review_status,''), '') = ''")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS playbooks (
               id TEXT PRIMARY KEY,
@@ -1444,6 +1551,7 @@ def init_board():
         conn.execute("UPDATE runs SET status = 'completed' WHERE lower(COALESCE(status,'')) IN ('completed','complete')")
         conn.execute("UPDATE runs SET status = 'cancelled' WHERE lower(COALESCE(status,'')) IN ('cancelled','canceled')")
         backfill_run_semantics(conn)
+        reconcile_stale_running_runs(conn)
         conn.execute("UPDATE agents SET deployment_status = COALESCE(NULLIF(deployment_status,''), 'not_deployed')")
 
         proposal_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
@@ -1784,6 +1892,13 @@ def normalize_task_row(row, conn: sqlite3.Connection) -> dict | None:
     latest_output = task_latest_output(conn, item['id'])
     item['latest_output'] = latest_output
     item['latestOutput'] = latest_output
+    completion_state = task_completion_state_for(item, latest_output)
+    item['completion_state'] = completion_state
+    item['completionState'] = completion_state
+    item['latest_output_review_status'] = normalize_task_output_review_status((latest_output or {}).get('review_status')) if latest_output else 'unreviewed'
+    item['latestOutputReviewStatus'] = item['latest_output_review_status']
+    item['can_complete_from_workspace'] = task_completion_ready(latest_output) and item['status'] != 'completed'
+    item['canCompleteFromWorkspace'] = item['can_complete_from_workspace']
     return item
 
 
@@ -1846,6 +1961,14 @@ def normalize_task_output_row(row, conn: sqlite3.Connection | None = None) -> di
     item['generation_source'] = str(item.get('generation_source') or '')
     item['generation_note'] = str(item.get('generation_note') or '')
     item['context_summary'] = str(item.get('context_summary') or '')
+    item['review_status'] = normalize_task_output_review_status(item.get('review_status'))
+    item['review_note'] = str(item.get('review_note') or '')
+    item['reviewed_by'] = str(item.get('reviewed_by') or 'operator')
+    item['reviewed_at'] = str(item.get('reviewed_at') or '')
+    item['review_proposal_id'] = str(item.get('review_proposal_id') or '')
+    item['review_proposal_title'] = str(item.get('review_proposal_title') or '')
+    item['approved_at'] = str(item.get('approved_at') or '')
+    item['revision_requested_at'] = str(item.get('revision_requested_at') or '')
     item['created_by'] = str(item.get('created_by') or 'operator')
     item['created_at'] = str(item.get('created_at') or '')
     item['updated_at'] = str(item.get('updated_at') or item['created_at'] or '')
@@ -1860,6 +1983,14 @@ def normalize_task_output_row(row, conn: sqlite3.Connection | None = None) -> di
     item['generationSource'] = item['generation_source']
     item['generationNote'] = item['generation_note']
     item['contextSummary'] = item['context_summary']
+    item['reviewStatus'] = item['review_status']
+    item['reviewNote'] = item['review_note']
+    item['reviewedBy'] = item['reviewed_by']
+    item['reviewedAt'] = item['reviewed_at']
+    item['reviewProposalId'] = item['review_proposal_id']
+    item['reviewProposalTitle'] = item['review_proposal_title']
+    item['approvedAt'] = item['approved_at']
+    item['revisionRequestedAt'] = item['revision_requested_at']
     item['createdBy'] = item['created_by']
     item['createdAt'] = item['created_at']
     item['updatedAt'] = item['updated_at']
@@ -1909,6 +2040,199 @@ def task_output_count(conn: sqlite3.Connection, task_id: str) -> int:
     return int((row['count'] if row else 0) or 0)
 
 
+TASK_OUTPUT_REVIEW_STATUSES = {'unreviewed', 'needs_revision', 'usable', 'approved'}
+TASK_COMPLETION_READY_OUTPUT_REVIEW_STATUSES = {'usable', 'approved'}
+
+
+def normalize_task_output_review_status(value) -> str:
+    review_status = str(value or '').strip().lower()
+    if review_status == 'pending':
+        review_status = 'unreviewed'
+    return review_status if review_status in TASK_OUTPUT_REVIEW_STATUSES else 'unreviewed'
+
+
+def task_completion_state_for(task: dict | None, latest_output: dict | None) -> str:
+    task_status = normalize_task_status((task or {}).get('status') or 'backlog')
+    if task_status == 'completed':
+        return 'completed'
+    if latest_output is None:
+        return 'awaiting_output'
+    review_status = normalize_task_output_review_status((latest_output or {}).get('review_status'))
+    if review_status in TASK_COMPLETION_READY_OUTPUT_REVIEW_STATUSES:
+        return 'ready_to_complete'
+    if review_status == 'needs_revision':
+        return 'revision_requested'
+    return 'awaiting_output_review'
+
+
+def task_completion_ready(latest_output: dict | None) -> bool:
+    if latest_output is None:
+        return False
+    return normalize_task_output_review_status((latest_output or {}).get('review_status')) in TASK_COMPLETION_READY_OUTPUT_REVIEW_STATUSES
+
+
+def tokenize_retrieval_text(*values) -> list[str]:
+    tokens: list[str] = []
+    seen = set()
+    for value in values:
+        for token in re.findall(r'[a-z0-9]{3,}', str(value or '').lower()):
+            if token in VAULT_INTELLIGENCE_STOPWORDS:
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
+def build_task_retrieval_query(conn: sqlite3.Connection, task: dict) -> dict:
+    task_id = str(task.get('id') or '')
+    latest_run = task_runs_list(conn, task_id)[0] if task_id else None
+    latest_output = task_latest_output(conn, task_id) if task_id else None
+    parts = [
+        str(task.get('title') or ''),
+        str(task.get('instruction') or task.get('description') or ''),
+        str(task.get('audit_note') or ''),
+        str(task.get('last_note') or ''),
+        str(task.get('result_text') or ''),
+        str(task.get('linked_playbook_name') or ''),
+        str(task.get('assigned_agent_name') or ''),
+        str((latest_run or {}).get('summary') or (latest_run or {}).get('result_text') or ''),
+        str((latest_output or {}).get('title') or ''),
+        str((latest_output or {}).get('content') or ''),
+    ]
+    query_text = '\n'.join(part for part in parts if str(part or '').strip())
+    return {
+        'text': query_text,
+        'tokens': tokenize_retrieval_text(query_text),
+        'latest_run': latest_run,
+        'latest_output': latest_output,
+    }
+
+
+def summarize_retrieval_reason(matches: list[str], same_task: bool = False, same_playbook: bool = False) -> str:
+    reasons: list[str] = []
+    if same_task:
+        reasons.append('same task history')
+    if same_playbook:
+        reasons.append('same playbook')
+    if matches:
+        reasons.append('matched: ' + ', '.join(matches[:4]))
+    return ' · '.join(reasons) or 'task context match'
+
+
+def score_retrieval_candidate(task: dict, query: dict, candidate_text: str, *, same_task: bool = False, same_playbook: bool = False, same_agent: bool = False, is_output: bool = False) -> tuple[float, list[str], str]:
+    task_tokens = list(query.get('tokens') or [])
+    candidate_tokens = tokenize_retrieval_text(candidate_text)
+    overlap = [token for token in task_tokens if token in candidate_tokens]
+    score = float(len(overlap))
+    if task_tokens:
+        score += min(2.5, len(overlap) / max(1, len(task_tokens)) * 6)
+    task_title = str(task.get('title') or '').strip().lower()
+    task_instruction = str(task.get('instruction') or task.get('description') or '').strip().lower()
+    lowered_candidate = candidate_text.lower()
+    if task_title and task_title in lowered_candidate:
+        score += 2.25
+    if task_instruction:
+        instruction_tokens = tokenize_retrieval_text(task_instruction)
+        if instruction_tokens:
+            instruction_overlap = len([token for token in instruction_tokens[:8] if token in candidate_tokens])
+            score += min(1.75, instruction_overlap * 0.45)
+    if same_task:
+        score += 3.5
+    if same_playbook:
+        score += 1.25
+    if same_agent:
+        score += 0.5
+    if is_output:
+        score += 0.35
+    return score, overlap[:6], summarize_retrieval_reason(overlap[:6], same_task=same_task, same_playbook=same_playbook)
+
+
+def rank_relevant_memories(conn: sqlite3.Connection, task: dict, limit: int = 4) -> list[dict]:
+    query = build_task_retrieval_query(conn, task)
+    rows = conn.execute("SELECT * FROM vault_records ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 80").fetchall()
+    scored: list[dict] = []
+    task_id = str(task.get('id') or '')
+    playbook_name = str(task.get('linked_playbook_name') or '').strip().lower()
+    agent_name = str(task.get('assigned_agent_name') or '').strip().lower()
+    for row in rows:
+        memory = normalize_vault_record_row(row, conn)
+        if memory is None:
+            continue
+        candidate_text = '\n'.join([
+            str(memory.get('title') or ''),
+            str(memory.get('content') or ''),
+            str(memory.get('memory_type') or ''),
+            str(((memory.get('source_task') or {}).get('title')) or ''),
+        ])
+        same_task = str(memory.get('source_task_id') or '') == task_id
+        same_playbook = bool(playbook_name and playbook_name in candidate_text.lower())
+        same_agent = bool(agent_name and agent_name in candidate_text.lower())
+        score, matches, reason = score_retrieval_candidate(task, query, candidate_text, same_task=same_task, same_playbook=same_playbook, same_agent=same_agent)
+        if score <= 0 and not same_task:
+            continue
+        item = dict(memory)
+        item['preview'] = trim_run_text(str(memory.get('content') or memory.get('title') or ''), 180)
+        item['relevance_score'] = round(score, 3)
+        item['matched_terms'] = matches
+        item['relevance_reason'] = reason
+        item['is_same_task'] = same_task
+        item['isSameTask'] = same_task
+        scored.append(item)
+    scored.sort(key=lambda item: (float(item.get('relevance_score') or 0), str(item.get('updated_at') or ''), str(item.get('created_at') or '')), reverse=True)
+    return scored[:max(1, limit)]
+
+
+def rank_relevant_outputs(conn: sqlite3.Connection, task: dict, limit: int = 4) -> list[dict]:
+    query = build_task_retrieval_query(conn, task)
+    rows = conn.execute("SELECT * FROM task_outputs ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 80").fetchall()
+    scored: list[dict] = []
+    task_id = str(task.get('id') or '')
+    playbook_name = str(task.get('linked_playbook_name') or '').strip().lower()
+    agent_name = str(task.get('assigned_agent_name') or '').strip().lower()
+    for row in rows:
+        output = normalize_task_output_row(row, conn)
+        if output is None:
+            continue
+        candidate_text = '\n'.join([
+            str(output.get('title') or ''),
+            str(output.get('content') or ''),
+            str(output.get('output_type') or ''),
+            str(output.get('format_hint') or ''),
+            str(output.get('playbook_name') or ''),
+        ])
+        same_task = str(output.get('source_task_id') or '') == task_id
+        same_playbook = bool(playbook_name and playbook_name in candidate_text.lower())
+        same_agent = bool(agent_name and agent_name in candidate_text.lower())
+        score, matches, reason = score_retrieval_candidate(task, query, candidate_text, same_task=same_task, same_playbook=same_playbook, same_agent=same_agent, is_output=True)
+        if score <= 0 and not same_task:
+            continue
+        item = dict(output)
+        item['preview'] = trim_run_text(str(output.get('content') or output.get('title') or ''), 180)
+        item['relevance_score'] = round(score, 3)
+        item['matched_terms'] = matches
+        item['relevance_reason'] = reason
+        item['is_same_task'] = same_task
+        item['isSameTask'] = same_task
+        scored.append(item)
+    scored.sort(key=lambda item: (float(item.get('relevance_score') or 0), str(item.get('updated_at') or ''), str(item.get('created_at') or '')), reverse=True)
+    return scored[:max(1, limit)]
+
+
+def build_relevant_context_summary(task: dict, relevant_memories: list[dict], relevant_outputs: list[dict]) -> str:
+    parts: list[str] = []
+    if relevant_memories:
+        memory = relevant_memories[0]
+        parts.append(f"Memory: {memory.get('title') or 'Untitled'} ({memory.get('relevance_reason') or 'task context match'})")
+    if relevant_outputs:
+        output = relevant_outputs[0]
+        parts.append(f"Output: {output.get('title') or 'Untitled'} ({output.get('relevance_reason') or 'task context match'})")
+    if not parts:
+        parts.append(f"No ranked vault or output context yet for {str(task.get('title') or 'this task').strip() or 'this task'}.")
+    return trim_run_text(' | '.join(parts), 280)
+
+
 def create_task_output_record(conn: sqlite3.Connection, payload: dict | None = None) -> dict:
     payload = dict(payload or {})
     source_task_id = str(payload.get('source_task_id', payload.get('task_id', payload.get('sourceTaskId', payload.get('taskId', '')))) or '').strip()
@@ -1950,6 +2274,14 @@ def create_task_output_record(conn: sqlite3.Connection, payload: dict | None = N
         'generation_source': str(payload.get('generation_source', payload.get('generationSource', '')) or '').strip(),
         'generation_note': str(payload.get('generation_note', payload.get('generationNote', '')) or '').strip(),
         'context_summary': str(payload.get('context_summary', payload.get('contextSummary', '')) or '').strip(),
+        'review_status': normalize_task_output_review_status(payload.get('review_status', payload.get('reviewStatus', 'unreviewed'))),
+        'review_note': str(payload.get('review_note', payload.get('reviewNote', '')) or '').strip(),
+        'reviewed_by': str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
+        'reviewed_at': str(payload.get('reviewed_at', payload.get('reviewedAt', '')) or '').strip(),
+        'review_proposal_id': str(payload.get('review_proposal_id', payload.get('reviewProposalId', payload.get('proposal_id', payload.get('proposalId', '')))) or '').strip(),
+        'review_proposal_title': str(payload.get('review_proposal_title', payload.get('reviewProposalTitle', '')) or '').strip(),
+        'approved_at': str(payload.get('approved_at', payload.get('approvedAt', '')) or '').strip(),
+        'revision_requested_at': str(payload.get('revision_requested_at', payload.get('revisionRequestedAt', '')) or '').strip(),
         'created_by': str(payload.get('created_by', payload.get('createdBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator',
         'created_at': now,
         'updated_at': now,
@@ -1957,14 +2289,132 @@ def create_task_output_record(conn: sqlite3.Connection, payload: dict | None = N
     conn.execute(
         """
         INSERT INTO task_outputs (
-          id, source_task_id, source_run_id, agent_id, agent_name_snapshot, playbook_id, playbook_name, title, content, output_type, format_hint, status, generation_source, generation_note, context_summary, created_by, created_at, updated_at
+          id, source_task_id, source_run_id, agent_id, agent_name_snapshot, playbook_id, playbook_name, title, content, output_type, format_hint, status, generation_source, generation_note, context_summary, review_status, review_note, reviewed_by, reviewed_at, review_proposal_id, review_proposal_title, approved_at, revision_requested_at, created_by, created_at, updated_at
         ) VALUES (
-          :id, :source_task_id, :source_run_id, :agent_id, :agent_name_snapshot, :playbook_id, :playbook_name, :title, :content, :output_type, :format_hint, :status, :generation_source, :generation_note, :context_summary, :created_by, :created_at, :updated_at
+          :id, :source_task_id, :source_run_id, :agent_id, :agent_name_snapshot, :playbook_id, :playbook_name, :title, :content, :output_type, :format_hint, :status, :generation_source, :generation_note, :context_summary, :review_status, :review_note, :reviewed_by, :reviewed_at, :review_proposal_id, :review_proposal_title, :approved_at, :revision_requested_at, :created_by, :created_at, :updated_at
         )
         """,
         item,
     )
     return normalize_task_output_row(item, conn)
+
+
+def review_task_output(output_id: str, payload: dict | None = None):
+    if not output_id:
+        raise ValueError('output id is required')
+    payload = dict(payload or {})
+    review_status = normalize_task_output_review_status(payload.get('review_status', payload.get('reviewStatus', payload.get('status', ''))))
+    if review_status not in {'needs_revision', 'usable', 'approved'}:
+        raise ValueError('review_status must be needs_revision, usable, or approved')
+    with connect_board() as conn:
+        output_row = conn.execute("SELECT * FROM task_outputs WHERE id = ?", (output_id,)).fetchone()
+        if output_row is None:
+            raise KeyError('task output not found')
+        existing_output = normalize_task_output_row(output_row, conn)
+        if existing_output is None:
+            raise KeyError('task output not found')
+        task_id = str(existing_output.get('source_task_id') or '')
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise KeyError('linked task not found')
+        task = normalize_task_row(task_row, conn)
+        if task is None:
+            raise KeyError('linked task not found')
+        review_note = str(payload.get('review_note', payload.get('reviewNote', payload.get('note', ''))) or '').strip()
+        reviewed_by = str(payload.get('reviewed_by', payload.get('reviewedBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator'
+        proposal_id = str(payload.get('review_proposal_id', payload.get('reviewProposalId', payload.get('proposal_id', payload.get('proposalId', '')))) or '').strip()
+        proposal_title = str(payload.get('review_proposal_title', payload.get('reviewProposalTitle', '')) or '').strip()
+        proposal_record = None
+        if proposal_id:
+            proposal_row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+            if proposal_row is None:
+                raise ValueError('proposal_id does not match an existing proposal')
+            proposal_record = normalize_proposal_row(proposal_row, conn)
+            if proposal_record is None:
+                raise ValueError('proposal_id does not match an existing proposal')
+            if str(proposal_record.get('source_task_id') or '') != task_id:
+                raise ValueError('proposal_id is linked to a different task')
+            proposal_title = proposal_title or str(proposal_record.get('title') or '')
+        now = utc_now()
+        approved_at = now if review_status == 'approved' else ''
+        revision_requested_at = now if review_status == 'needs_revision' else ''
+        conn.execute(
+            """
+            UPDATE task_outputs
+            SET review_status = ?,
+                review_note = ?,
+                reviewed_by = ?,
+                reviewed_at = ?,
+                review_proposal_id = ?,
+                review_proposal_title = ?,
+                approved_at = ?,
+                revision_requested_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (review_status, review_note, reviewed_by, now, proposal_id, proposal_title, approved_at, revision_requested_at, now, output_id),
+        )
+        if review_status == 'needs_revision' and task.get('status') not in {'revision_requested', 'completed'}:
+            conn.execute("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?", ('revision_requested', now, task_id))
+            task_event_create(conn, task_id, 'status_changed', f"Status changed from {str(task.get('status') or '').replace('_', ' ').title() or 'Unknown'} to Revision Requested.", note=review_note, metadata={'from_status': task.get('status') or '', 'to_status': 'revision_requested', 'output_id': output_id})
+        linkage_metadata = {
+            'output_id': output_id,
+            'output_title': existing_output.get('title') or '',
+            'review_status': review_status,
+            'proposal_id': proposal_id,
+            'proposal_title': proposal_title,
+        }
+        task_event_create(conn, task_id, 'output_reviewed', f"Output reviewed as {review_status.replace('_', ' ')}.", note=review_note, metadata=linkage_metadata)
+        if review_status == 'needs_revision':
+            task_event_create(conn, task_id, 'output_revision_requested', 'Latest output marked for revision.', note=review_note, metadata=linkage_metadata)
+        if review_status == 'approved':
+            task_event_create(conn, task_id, 'output_approved', 'Latest output approved for completion.', note=review_note, metadata=linkage_metadata)
+        conn.commit()
+        return task_get(task_id)
+
+
+def complete_task_from_workspace(task_id: str, payload: dict | None = None):
+    if not task_id:
+        raise ValueError('task id is required')
+    payload = dict(payload or {})
+    with connect_board() as conn:
+        task_row = conn.execute(TASK_SELECT + " WHERE t.id = ?", (task_id,)).fetchone()
+        if task_row is None:
+            raise KeyError('task not found')
+        task = normalize_task_row(task_row, conn)
+        if task is None:
+            raise KeyError('task not found')
+        output_id = str(payload.get('output_id', payload.get('outputId', payload.get('latest_output_id', payload.get('latestOutputId', '')))) or '').strip()
+        output_record = None
+        if output_id:
+            output_row = conn.execute("SELECT * FROM task_outputs WHERE id = ?", (output_id,)).fetchone()
+            if output_row is None:
+                raise ValueError('output_id does not match an existing task output')
+            output_record = normalize_task_output_row(output_row, conn)
+            if output_record is None:
+                raise ValueError('output_id does not match an existing task output')
+            if str(output_record.get('source_task_id') or '') != task_id:
+                raise ValueError('output_id is linked to a different task')
+        else:
+            output_record = task_latest_output(conn, task_id)
+        if output_record is None:
+            raise ValueError('a saved output is required before completing the task')
+        if not task_completion_ready(output_record):
+            raise ValueError('latest output must be usable or approved before completing the task')
+        completion_note = str(payload.get('completion_note', payload.get('completionNote', payload.get('note', ''))) or '').strip()
+        proposal_id = str(payload.get('review_proposal_id', payload.get('reviewProposalId', payload.get('proposal_id', payload.get('proposalId', output_record.get('review_proposal_id') or '')))) or '').strip()
+        proposal_title = str(payload.get('review_proposal_title', payload.get('reviewProposalTitle', output_record.get('review_proposal_title') or '')) or '').strip()
+        now = utc_now()
+        previous_status = str(task.get('status') or '')
+        conn.execute(
+            "UPDATE tasks SET status = ?, result_text = ?, last_note = ?, updated_at = ? WHERE id = ?",
+            ('completed', str(output_record.get('content') or task.get('result_text') or ''), completion_note or str(task.get('last_note') or ''), now, task_id),
+        )
+        if previous_status != 'completed':
+            task_event_create(conn, task_id, 'status_changed', f"Status changed from {previous_status.replace('_', ' ').title() or 'Unknown'} to Completed.", note=completion_note, metadata={'from_status': previous_status, 'to_status': 'completed', 'output_id': output_record.get('id') or ''})
+        task_event_create(conn, task_id, 'task_completed_from_workspace', 'Task completed from the shared workspace.', note=completion_note, metadata={'output_id': output_record.get('id') or '', 'output_title': output_record.get('title') or '', 'review_status': output_record.get('review_status') or '', 'proposal_id': proposal_id, 'proposal_title': proposal_title})
+        conn.commit()
+        return task_get(task_id)
 
 
 def task_memory_count(conn: sqlite3.Connection, task_id: str) -> int:
@@ -2785,6 +3235,9 @@ def build_task_output_generation_context(conn: sqlite3.Connection, task: dict) -
         playbook_row = conn.execute("SELECT * FROM playbooks WHERE id = ?", (playbook_id,)).fetchone()
         if playbook_row is not None:
             playbook = normalize_playbook_row(playbook_row)
+    relevant_memories = rank_relevant_memories(conn, task)
+    relevant_outputs = rank_relevant_outputs(conn, task)
+    relevant_context_summary = build_relevant_context_summary(task, relevant_memories, relevant_outputs)
     return {
         'task': task,
         'runs': runs,
@@ -2797,6 +3250,9 @@ def build_task_output_generation_context(conn: sqlite3.Connection, task: dict) -
         'latest_output': latest_output,
         'agent': agent,
         'playbook': playbook,
+        'relevant_memories': relevant_memories,
+        'relevant_outputs': relevant_outputs,
+        'relevant_context_summary': relevant_context_summary,
     }
 
 
@@ -2820,11 +3276,14 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
         latest_output = context['latest_output']
         agent = context['agent']
         playbook = context['playbook']
+        relevant_memories = context.get('relevant_memories') or []
+        relevant_outputs = context.get('relevant_outputs') or []
+        relevant_context_summary = str(context.get('relevant_context_summary') or '')
 
         output_type = str(payload.get('output_type', payload.get('outputType', payload.get('type', 'generic'))) or 'generic').strip().lower() or 'generic'
         format_hint = str(payload.get('format_hint', payload.get('formatHint', '')) or '').strip()
-        generation_source = str(payload.get('generation_source', payload.get('generationSource', 'heuristic_task_output_v1')) or 'heuristic_task_output_v1').strip() or 'heuristic_task_output_v1'
-        generation_note = str(payload.get('generation_note', payload.get('generationNote', 'Generated from live task, run, memory, proposal, and playbook context.')) or '').strip()
+        generation_source = str(payload.get('generation_source', payload.get('generationSource', 'heuristic_task_output_vault_intelligence_v1')) or 'heuristic_task_output_vault_intelligence_v1').strip() or 'heuristic_task_output_vault_intelligence_v1'
+        generation_note = str(payload.get('generation_note', payload.get('generationNote', 'Generated from live task context plus ranked vault memory and saved output context.')) or '').strip()
         created_by = str(payload.get('created_by', payload.get('createdBy', payload.get('operator', 'operator'))) or 'operator').strip() or 'operator'
         task_title = str(task.get('title') or 'Untitled task').strip() or 'Untitled task'
         task_instruction = trim_run_text(str(task.get('instruction') or task.get('description') or ''), 320)
@@ -2832,6 +3291,8 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
         latest_memory_summary = trim_run_text(str((latest_memory or {}).get('content') or (latest_memory or {}).get('title') or ''), 180)
         latest_proposal_summary = trim_run_text(str((latest_proposal or {}).get('content') or (latest_proposal or {}).get('title') or ''), 180)
         latest_output_summary = trim_run_text(str((latest_output or {}).get('content') or (latest_output or {}).get('title') or ''), 180)
+        relevant_memory_summary = trim_run_text(' | '.join(f"{item.get('title') or 'Memory'}: {item.get('preview') or ''}" for item in relevant_memories[:3]), 260)
+        relevant_output_summary = trim_run_text(' | '.join(f"{item.get('title') or 'Output'}: {item.get('preview') or ''}" for item in relevant_outputs[:3]), 260)
         audit_note = trim_run_text(str(task.get('audit_note') or ''), 180)
         last_note = trim_run_text(str(task.get('last_note') or ''), 180)
         result_text = trim_run_text(str(task.get('result_text') or ''), 180)
@@ -2855,6 +3316,12 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
             signal_parts.append(f"Proposal context: {latest_proposal_summary}")
         if latest_output_summary:
             signal_parts.append(f"Previous output: {latest_output_summary}")
+        if relevant_memory_summary:
+            signal_parts.append(f"Relevant lessons: {relevant_memory_summary}")
+        if relevant_output_summary:
+            signal_parts.append(f"Relevant saved outputs: {relevant_output_summary}")
+        if relevant_context_summary:
+            signal_parts.append(f"Ranked context: {relevant_context_summary}")
         if playbook_name:
             signal_parts.append(f"Playbook: {playbook_name}")
         if agent_name:
@@ -2865,26 +3332,202 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
 
         requested_title = str(payload.get('title') or '').strip()
         title = requested_title or f"{task_title} Output"
+        playbook_slug = str((playbook or {}).get('slug') or '').strip().lower()
+        playbook_key = slugify(playbook_name or playbook_slug or 'generic', fallback='generic')
+        playbook_purpose = trim_run_text(str((playbook or {}).get('purpose') or (playbook or {}).get('description') or ''), 220)
+        playbook_sop = trim_run_text(str((playbook or {}).get('sop') or ''), 320)
+        task_status_label = str(task.get('status') or 'backlog').replace('_', ' ').title()
+        key_signal = latest_run_summary or result_text or last_note or audit_note or 'No execution signal captured yet.'
+        secondary_guidance = trim_run_text(' | '.join(part for part in [relevant_context_summary, relevant_memory_summary, relevant_output_summary, latest_memory_summary, latest_proposal_summary, latest_output_summary] if str(part or '').strip()), 260)
+        combined_context = '\n'.join(part for part in [task_title, task_instruction, latest_run_summary, result_text, audit_note, last_note, latest_memory_summary, latest_proposal_summary, latest_output_summary, relevant_memory_summary, relevant_output_summary, relevant_context_summary, format_hint, playbook_purpose, playbook_sop] if str(part or '').strip())
 
-        def brief_lines():
-            return [
+        def first_sentence(value, fallback=''):
+            text = re.sub(r'\s+', ' ', str(value or '')).strip()
+            if not text:
+                return fallback
+            parts = re.split(r'(?<=[.!?])\s+', text)
+            return trim_run_text(parts[0] if parts else text, 220)
+
+        def split_points(*values, limit=5):
+            points = []
+            seen = set()
+            for value in values:
+                text = str(value or '').replace('\r', '\n')
+                if not text.strip():
+                    continue
+                for raw in re.split(r'\n+|\s*[•\-]\s+|\s*\d+[.)]\s+', text):
+                    line = re.sub(r'\s+', ' ', raw).strip(' -•\t')
+                    if not line:
+                        continue
+                    if len(line) < 18 and ' ' not in line:
+                        continue
+                    key = line.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    points.append(trim_run_text(line, 180))
+                    if len(points) >= limit:
+                        return points
+            return points
+
+        def find_match(patterns, text):
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    groups = [group for group in match.groups() if group]
+                    if groups:
+                        return trim_run_text(groups[0], 120)
+                    return trim_run_text(match.group(0), 120)
+            return ''
+
+        def extract_labeled_value(text, labels):
+            for label in labels:
+                pattern = rf'{label}\s*[:\-]\s*([^\n.]+)'
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    return trim_run_text(match.group(1), 120)
+            return ''
+
+        def split_sentences(*values, limit=4):
+            items = []
+            seen = set()
+            for value in values:
+                text = re.sub(r'\s+', ' ', str(value or '')).strip()
+                if not text:
+                    continue
+                for raw in re.split(r'(?<=[.!?])\s+', text):
+                    line = raw.strip(' -•\t')
+                    if len(line) < 20:
+                        continue
+                    key = line.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    items.append(trim_run_text(line, 180))
+                    if len(items) >= limit:
+                        return items
+            return items
+
+        def company_research_brief_lines():
+            target_hint = first_sentence(task_instruction, '')
+            role_context = find_match([
+                r'for\s+([^.,;\n]+team)',
+                r'for\s+([^.,;\n]+role)',
+                r'with\s+([^.,;\n]+team)',
+                r'about\s+([^.,;\n]+company)',
+            ], combined_context)
+            if not role_context:
+                role_context = trim_run_text(task_title, 120)
+            overview = trim_run_text(target_hint or f"Compact research brief for {task_title}.", 220)
+            likely_need_points = split_sentences(task_instruction, playbook_purpose, limit=3)
+            if not likely_need_points:
+                likely_need_points = [
+                    'An AI developer who can turn loose workflow needs into working automations and internal tools.',
+                    'Someone comfortable shipping across prompts, backend logic, integrations, and operator UX.',
+                    'Clear communication around what can be delivered quickly versus what needs deeper system design.',
+                ]
+            talking_points = split_sentences(task_instruction, secondary_guidance, format_hint, limit=4)
+            if not talking_points:
+                talking_points = [
+                    f'Lead with the stated objective: {overview}',
+                    f'Anchor the conversation on the likely team context: {role_context}',
+                    f'Use the strongest current execution signal: {key_signal}',
+                ]
+            questions = [
+                f'What does success look like for this {"AI" if "ai" in combined_context.lower() else "role"} in the first 30 to 90 days?',
+                'Which workflows are currently manual, brittle, or hard to hand off across the team?',
+                'Do they need faster prototyping, better internal tooling, or cleaner productionization of AI features?',
+            ]
+            lines = [
                 f"# {title}",
                 '',
-                '## Objective',
-                task_instruction or f"Produce a usable deliverable for {task_title}.",
+                '## Brief Overview',
+                overview,
                 '',
-                '## Executive Summary',
-                trim_run_text(f"This draft supports {task_title}. It reflects the current task instruction, live task state, and the strongest recent execution signals available in the workspace.", 280),
+                '## Likely Team / Role Context',
+                trim_run_text(role_context or 'The task suggests an AI-focused team or role, but the exact company context is not fully specified yet.', 220),
+                '',
+                '## What They Likely Need From an AI Developer',
+            ]
+            lines.extend([f"- {point}" for point in likely_need_points[:3]])
+            lines.extend([
+                '',
+                '## Good Talking Points',
+            ])
+            lines.extend([f"- {point}" for point in talking_points[:4]])
+            if secondary_guidance:
+                lines.extend(['', '## Helpful Saved Context', f"- {secondary_guidance}"])
+            lines.extend([
+                '',
+                '## Smart Questions To Ask',
+            ])
+            lines.extend([f"- {question}" for question in questions])
+            return lines
+
+        def receipt_generation_lines():
+            customer_name = extract_labeled_value(combined_context, ['customer', 'client', 'payer', 'paid by'])
+            payment_date = extract_labeled_value(combined_context, ['payment date', 'date']) or find_match([r'((?:20\d{2}|\d{4})[-/]\d{1,2}[-/]\d{1,2})', r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+20\d{2})'], combined_context)
+            amount = extract_labeled_value(combined_context, ['amount', 'payment amount'])
+            if not amount:
+                amount = find_match([r'((?:PHP|USD|EUR|GBP|SGD|AUD|CAD)\s*[0-9][0-9,]*(?:\.\d{1,2})?)', r'([₱$€£]\s*[0-9][0-9,]*(?:\.\d{1,2})?)'], combined_context)
+            payment_method = extract_labeled_value(combined_context, ['payment method', 'method']) or find_match([r'(bank transfer|gcash|paymaya|maya|paypal|wise|credit card|debit card|cash)'], combined_context)
+            reference_number = extract_labeled_value(combined_context, ['reference number', 'reference', 'ref', 'transaction id', 'txn']) or find_match([r'(?:reference|ref|transaction|txn)(?:\s*(?:number|no\.?|id))?[:#\s-]+([A-Za-z0-9\-]+)'], combined_context)
+            service_or_product = extract_labeled_value(combined_context, ['service', 'purpose', 'project'])
+            if not service_or_product:
+                service_or_product = find_match([r'for\s+([A-Za-z0-9 ,.&\/-]{3,100})'], task_instruction or task_title) or trim_run_text(task_title, 100)
+            status = 'Draft' if amount and (customer_name or service_or_product) else 'Incomplete — missing one or more key payment fields.'
+            lines = [
+                f"# {title}",
+                '',
+                'Receipt Draft',
+                '',
+                f"Receipt For: {customer_name or '[Customer name not provided]'}",
+                f"Payment Date: {payment_date or '[Payment date not provided]'}",
+                f"Amount Received: {amount or '[Payment amount not provided]'}",
+                f"Payment Method: {payment_method or '[Payment method not provided]'}",
+                f"Reference Number: {reference_number or '[Reference number not provided]'}",
+                f"Service / Purpose: {service_or_product or '[Service or purpose not provided]'}",
+                f"Status: {status}",
+                '',
+                'Statement',
+                trim_run_text(f"This acknowledges receipt of {amount or 'the recorded payment'} from {customer_name or 'the customer'} for {service_or_product or 'the stated service'}.", 220),
+            ]
+            if secondary_guidance:
+                lines.extend(['', 'Supporting Context', f"- {secondary_guidance}"])
+            if 'Incomplete' in status:
+                lines.extend(['', 'Missing Details To Confirm'])
+                for missing in [
+                    ('customer name', customer_name),
+                    ('payment date', payment_date),
+                    ('payment amount', amount),
+                    ('payment method', payment_method),
+                ]:
+                    if not missing[1]:
+                        lines.append(f"- Confirm the {missing[0]}.")
+            return lines
+
+        def brief_lines():
+            summary_points = split_points(task_instruction, latest_run_summary, secondary_guidance, limit=4)
+            if not summary_points:
+                summary_points = [overview for overview in [first_sentence(task_instruction, ''), key_signal, secondary_guidance] if overview]
+            lines = [
+                f"# {title}",
+                '',
+                '## Summary',
+                first_sentence(task_instruction, f"Working brief for {task_title}."),
                 '',
                 '## Key Points',
-                f"- Assignee: {agent_name or 'Unassigned'}",
-                f"- Playbook: {playbook_name or 'None linked'}",
-                f"- Task status: {str(task.get('status') or 'backlog').replace('_', ' ').title()}",
-                f"- Latest signal: {latest_run_summary or result_text or last_note or 'No recent signal captured yet.'}",
-                '',
-                '## Recommended Next Step',
-                trim_run_text(last_note or audit_note or 'Review this draft, tighten wording if needed, then use it as the working output for the task.', 220),
             ]
+            lines.extend([f"- {point}" for point in summary_points[:4]])
+            if relevant_memories:
+                lines.extend(['', '## Relevant Lessons'])
+                lines.extend([f"- {item.get('title') or 'Memory'}: {item.get('preview') or '—'}" for item in relevant_memories[:3]])
+            if relevant_outputs:
+                lines.extend(['', '## Reference Outputs'])
+                lines.extend([f"- {item.get('title') or 'Output'}: {item.get('preview') or '—'}" for item in relevant_outputs[:2]])
+            if playbook_purpose or playbook_sop:
+                lines.extend(['', '## Playbook Guidance', playbook_purpose or playbook_sop])
+            return lines
 
         def checklist_lines():
             base_signal = latest_run_summary or result_text or last_note or 'Confirm the latest task context before sending.'
@@ -2894,6 +3537,7 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
                 '## Checklist',
                 f"- Reconfirm the objective: {task_instruction or task_title}",
                 f"- Review the latest execution signal: {base_signal}",
+                f"- Reuse ranked context: {relevant_context_summary or 'No ranked context surfaced yet.'}",
                 f"- Apply the linked playbook guidance: {playbook_name or 'No linked playbook'}",
                 f"- Incorporate memory/proposal context: {latest_memory_summary or latest_proposal_summary or 'No extra context saved yet.'}",
                 '- Finalize the deliverable and save/send it through the next operator step.',
@@ -2911,41 +3555,52 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
                 '',
                 trim_run_text(f"Key context: {supporting}", 260),
                 '',
+                trim_run_text(f"Retrieved context: {relevant_context_summary or secondary_guidance or 'No ranked vault/output context yet.'}", 260),
+                '',
                 trim_run_text('Next step: review this draft for tone, accuracy, and any task-specific details before sending or publishing it.', 220),
                 '',
                 'Best,',
                 agent_name or 'Operator',
             ]
 
-        def generic_lines():
-            key_signal = latest_run_summary or result_text or last_note or audit_note or 'No execution signal captured yet.'
-            return [
+        def plain_deliverable_lines():
+            opener = first_sentence(task_instruction, f"Working draft for {task_title}.")
+            body_points = split_points(task_instruction, latest_run_summary, result_text, last_note, latest_memory_summary, latest_proposal_summary, limit=5)
+            if not body_points:
+                body_points = [key_signal]
+            lines = [
                 f"# {title}",
                 '',
-                '## Objective',
-                task_instruction or f"Produce a usable output for {task_title}.",
+                opener,
                 '',
-                '## Draft Deliverable',
-                trim_run_text(f"This output is prepared for {task_title}. Use it as the current working artifact linked to the task workspace.", 260),
-                '',
-                '## Key Considerations',
-                f"- Assignee context: {agent_name or 'Unassigned'}",
-                f"- Playbook context: {playbook_name or 'No linked playbook'}",
-                f"- Latest signal: {key_signal}",
-                f"- Supporting context: {latest_memory_summary or latest_proposal_summary or 'No saved memory/proposal context yet.'}",
-                '',
-                '## Operator Next Step',
-                trim_run_text(format_hint or 'Review the draft, tighten specifics, then use this as the persisted task output for follow-up work.', 220),
             ]
+            if playbook_purpose:
+                lines.extend([playbook_purpose, ''])
+            lines.append('Key details:')
+            lines.extend([f"- {point}" for point in body_points[:5]])
+            if relevant_memories:
+                lines.extend(['', 'Relevant lessons:'])
+                lines.extend([f"- {item.get('title') or 'Memory'}: {item.get('preview') or '—'}" for item in relevant_memories[:3]])
+            if relevant_outputs:
+                lines.extend(['', 'Reference outputs:'])
+                lines.extend([f"- {item.get('title') or 'Output'}: {item.get('preview') or '—'}" for item in relevant_outputs[:2]])
+            if secondary_guidance:
+                lines.extend(['', 'Supporting context:', f"- {secondary_guidance}"])
+            lines.extend(['', f"Current task status: {task_status_label}."])
+            return lines
 
-        if output_type in {'brief', 'summary'}:
+        if playbook_key in {'company-research-brief', 'company-research-brief-2'}:
+            content = '\n'.join(company_research_brief_lines()).strip()
+        elif playbook_key == 'receipt-generation':
+            content = '\n'.join(receipt_generation_lines()).strip()
+        elif output_type in {'brief', 'summary'}:
             content = '\n'.join(brief_lines()).strip()
         elif output_type == 'checklist':
             content = '\n'.join(checklist_lines()).strip()
         elif output_type in {'response', 'email', 'reply'} or 'email' in format_hint.lower():
             content = '\n'.join(response_lines()).strip()
         else:
-            content = '\n'.join(generic_lines()).strip()
+            content = '\n'.join(plain_deliverable_lines()).strip()
 
         ctx = run_context_for_task(conn, task_id=task_id, task=task)
         create_ctx = {key: value for key, value in ctx.items() if key != 'result_text'}
@@ -2966,7 +3621,7 @@ def generate_task_output(task_id: str, payload: dict | None = None) -> dict:
         task_event_create(conn, task_id, 'output_generation_requested', f"Output generation requested for: {task_title}.", note=context_summary or generation_note, metadata={'run_id': run['id'], 'output_type': output_type, 'format_hint': format_hint, 'generation_source': generation_source})
         append_trace_event(conn, run['id'], event_type='planning', event_label='Planning output generation', event_detail='Preparing the task output request and output format.', event_status='success', metadata={'task_id': task_id, 'output_type': output_type})
         mark_run_running(conn, run['id'], summary=trim_run_text(f"Generating output for task \"{task_title}\".", 220), run_detail='Assembling live task context and rendering the first persisted output draft.', result_label='Running', result_summary=trim_run_text(context_summary, 220), output_status='running', log_preview=trim_run_text(context_summary or generation_note, 420), trigger_label='Task output generation', **create_ctx)
-        append_trace_event(conn, run['id'], event_type='context_assembly', event_label='Context assembled', event_detail='Collected task, run, memory, proposal, and playbook context for output generation.', event_status='success', metadata={'task_id': task_id, 'memory_count': len(context['memories']), 'proposal_count': len(context['proposals']), 'existing_output_count': len(context['outputs'])})
+        append_trace_event(conn, run['id'], event_type='context_assembly', event_label='Context assembled', event_detail='Collected task, run, proposal, playbook, and ranked vault/output context for output generation.', event_status='success', metadata={'task_id': task_id, 'memory_count': len(context['memories']), 'proposal_count': len(context['proposals']), 'existing_output_count': len(context['outputs']), 'relevant_memory_count': len(relevant_memories), 'relevant_output_count': len(relevant_outputs)})
         try:
             output = create_task_output_record(conn, {
                 'source_task_id': task_id,
@@ -3008,11 +3663,16 @@ def build_task_proposal_generation_context(conn: sqlite3.Connection, task: dict)
     runs = task_runs_list(conn, task_id)
     memories = task_memories_list(conn, task_id)
     proposals = task_proposals_list(conn, task_id)
+    outputs = task_outputs_list(conn, task_id)
     adaptations = task_adaptations_list(conn, task_id)
     latest_run = runs[0] if runs else None
     latest_memory = memories[0] if memories else None
+    latest_output = outputs[0] if outputs else None
     latest_adaptation = adaptations[0] if adaptations else None
     latest_generated = next((proposal for proposal in proposals if str(proposal.get('origin') or '') == 'generated'), None)
+    relevant_memories = rank_relevant_memories(conn, task)
+    relevant_outputs = rank_relevant_outputs(conn, task)
+    relevant_context_summary = build_relevant_context_summary(task, relevant_memories, relevant_outputs)
     return {
         'task': task,
         'runs': runs,
@@ -3021,8 +3681,13 @@ def build_task_proposal_generation_context(conn: sqlite3.Connection, task: dict)
         'latest_memory': latest_memory,
         'proposals': proposals,
         'latest_generated': latest_generated,
+        'outputs': outputs,
+        'latest_output': latest_output,
         'adaptations': adaptations,
         'latest_adaptation': latest_adaptation,
+        'relevant_memories': relevant_memories,
+        'relevant_outputs': relevant_outputs,
+        'relevant_context_summary': relevant_context_summary,
     }
 
 
@@ -3040,7 +3705,11 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
         context = build_task_proposal_generation_context(conn, task)
         latest_run = context['latest_run']
         latest_memory = context['latest_memory']
+        latest_output = context['latest_output']
         latest_adaptation = context['latest_adaptation']
+        relevant_memories = context.get('relevant_memories') or []
+        relevant_outputs = context.get('relevant_outputs') or []
+        relevant_context_summary = str(context.get('relevant_context_summary') or '')
         generated_count = sum(1 for proposal in context['proposals'] if str(proposal.get('origin') or '') == 'generated')
 
         signal_parts = []
@@ -3052,8 +3721,12 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
         latest_run_summary = trim_run_text(str((latest_run or {}).get('summary') or (latest_run or {}).get('result_text') or ''), 180)
         latest_memory_title = str((latest_memory or {}).get('title') or '').strip()
         latest_memory_content = trim_run_text(str((latest_memory or {}).get('content') or ''), 160)
+        latest_output_title = str((latest_output or {}).get('title') or '').strip()
+        latest_output_content = trim_run_text(str((latest_output or {}).get('content') or ''), 180)
         latest_adaptation_status = str((latest_adaptation or {}).get('execution_status') or '').strip()
         latest_adaptation_outcome = trim_run_text(str((latest_adaptation or {}).get('outcome_text') or (latest_adaptation or {}).get('execution_summary') or ''), 160)
+        relevant_memory_summary = trim_run_text(' | '.join(f"{item.get('title') or 'Memory'}: {item.get('preview') or ''}" for item in relevant_memories[:3]), 260)
+        relevant_output_summary = trim_run_text(' | '.join(f"{item.get('title') or 'Output'}: {item.get('preview') or ''}" for item in relevant_outputs[:3]), 260)
 
         if task_instruction:
             signal_parts.append(f"Task instruction: {task_instruction}")
@@ -3067,6 +3740,14 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
             signal_parts.append(f"Operator note: {last_note}")
         if latest_memory_title or latest_memory_content:
             signal_parts.append(f"Vault context: {latest_memory_title or latest_memory_content}")
+        if latest_output_title or latest_output_content:
+            signal_parts.append(f"Saved output: {latest_output_title or latest_output_content}")
+        if relevant_memory_summary:
+            signal_parts.append(f"Relevant lessons: {relevant_memory_summary}")
+        if relevant_output_summary:
+            signal_parts.append(f"Relevant outputs: {relevant_output_summary}")
+        if relevant_context_summary:
+            signal_parts.append(f"Ranked context: {relevant_context_summary}")
         if latest_adaptation_status or latest_adaptation_outcome:
             signal_parts.append(f"Adaptation status: {latest_adaptation_status or 'none'} {latest_adaptation_outcome}".strip())
 
@@ -3080,6 +3761,8 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
                 proposal_type = 'quality'
             elif task_status in ('blocked', 'revision_requested') or latest_run_status == 'failed' or latest_adaptation_status == 'failed':
                 proposal_type = 'workflow'
+            elif latest_output_title or relevant_outputs:
+                proposal_type = 'quality'
             elif latest_memory_title or latest_memory_content:
                 proposal_type = 'memory'
             else:
@@ -3094,6 +3777,9 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
         elif latest_run_status == 'failed' or latest_adaptation_status == 'failed' or task_status == 'blocked':
             title = f"Add failure recovery steps for {task_title}"
             rationale = "The task hit a visible blocker, so the next proposal should reduce repeat failure and improve operator recovery."
+        elif latest_output_title or relevant_outputs:
+            title = f"Improve the saved output quality for {task_title}"
+            rationale = "The task already has a concrete saved output, so the next proposal should help improve the actual result instead of adding a generic side note."
         elif latest_memory_title or latest_memory_content:
             title = f"Promote {task_title} lesson into reusable operator guidance"
             rationale = "The task already produced reusable memory, so the next proposal should turn that into a repeatable workflow improvement."
@@ -3110,16 +3796,26 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
             f"- Proposal type: {proposal_type.replace('_', ' ')}",
             f"- Adaptation target: {adaptation_type.replace('_', ' ')}",
             f"- Why now: {context_summary or 'The task already has enough context to justify a reviewable proposal draft.'}",
+            f"- Output anchor: {latest_output_title or relevant_output_summary or 'No saved output context yet.'}",
+            f"- Memory anchor: {relevant_memory_summary or latest_memory_title or latest_memory_content or 'No vault lesson surfaced yet.'}",
             '- Operator action: review this draft, edit if needed, then accept before sending it into approval.',
         ]
         content = '\n'.join(line for line in content_lines if line is not None).strip()
 
         confidence_score = min(0.95, 0.35 + (0.12 if latest_run else 0) + (0.1 if latest_memory else 0) + (0.1 if audit_note else 0) + (0.1 if latest_adaptation else 0) + (0.05 if task_status in ('blocked', 'revision_requested') else 0))
         confidence_label = 'high' if confidence_score >= 0.75 else 'medium' if confidence_score >= 0.5 else 'low'
-        generation_source = str(payload.get('generation_source') or payload.get('generationSource') or 'heuristic_task_context_v1').strip() or 'heuristic_task_context_v1'
-        generation_note = str(payload.get('generation_note') or payload.get('generationNote') or 'Generated from live task, run, memory, audit, and adaptation context.').strip()
+        generation_source = str(payload.get('generation_source') or payload.get('generationSource') or 'heuristic_task_context_vault_intelligence_v1').strip() or 'heuristic_task_context_vault_intelligence_v1'
+        generation_note = str(payload.get('generation_note') or payload.get('generationNote') or 'Generated from live task context plus ranked vault memory and saved output context.').strip()
         source_run_id = str(payload.get('source_run_id') or payload.get('sourceRunId') or (latest_run or {}).get('id') or '')
-        source_memory_id = str(payload.get('source_memory_id') or payload.get('sourceMemoryId') or (latest_memory or {}).get('id') or '')
+        source_memory_id = str(payload.get('source_memory_id') or payload.get('sourceMemoryId') or '').strip()
+        if not source_memory_id:
+            ranked_memory = relevant_memories[0] if relevant_memories else None
+            ranked_memory_task_id = str((ranked_memory or {}).get('source_task_id') or '').strip()
+            latest_memory_task_id = str((latest_memory or {}).get('source_task_id') or '').strip()
+            if ranked_memory and ranked_memory_task_id == task_id:
+                source_memory_id = str(ranked_memory.get('id') or '').strip()
+            elif not ranked_memory and latest_memory and latest_memory_task_id == task_id:
+                source_memory_id = str(latest_memory.get('id') or '').strip()
 
         task_event_create(
             conn,
@@ -3133,8 +3829,11 @@ def generate_proposal_draft(task_id: str, payload: dict | None = None) -> dict:
                 'adaptation_type': adaptation_type,
                 'run_count': len(context['runs']),
                 'memory_count': len(context['memories']),
+                'output_count': len(context['outputs']),
                 'adaptation_count': len(context['adaptations']),
                 'existing_generated_count': generated_count,
+                'relevant_memory_count': len(relevant_memories),
+                'relevant_output_count': len(relevant_outputs),
                 'source_run_id': source_run_id,
                 'source_memory_id': source_memory_id,
             },
@@ -3650,11 +4349,16 @@ def task_get(task_id: str):
         if row is None:
             raise KeyError('task not found')
         task = normalize_task_row(row, conn)
+        if task is None:
+            raise KeyError('task not found')
         runs = task_runs_list(conn, task_id)
         latest_run = runs[0] if runs else None
         linked_memories = task_memories_list(conn, task_id)
         linked_proposals = task_proposals_list(conn, task_id)
         linked_outputs = task_outputs_list(conn, task_id)
+        relevant_memories = rank_relevant_memories(conn, task)
+        relevant_outputs = rank_relevant_outputs(conn, task)
+        relevant_context_summary = build_relevant_context_summary(task, relevant_memories, relevant_outputs)
         latest_output = linked_outputs[0] if linked_outputs else None
         task['runs'] = runs
         task['latest_run'] = latest_run
@@ -3672,7 +4376,13 @@ def task_get(task_id: str):
         task['outputCount'] = len(linked_outputs)
         task['latest_output'] = latest_output
         task['latestOutput'] = latest_output
-        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals), 'linked_outputs': linked_outputs, 'output_count': len(linked_outputs), 'latest_output': latest_output, 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
+        task['relevant_memories'] = relevant_memories
+        task['relevantMemories'] = relevant_memories
+        task['relevant_outputs'] = relevant_outputs
+        task['relevantOutputs'] = relevant_outputs
+        task['relevant_context_summary'] = relevant_context_summary
+        task['relevantContextSummary'] = relevant_context_summary
+        return {'task': task, 'history': task_history_list(conn, task_id), 'runs': runs, 'latest_run': latest_run, 'linked_memories': linked_memories, 'memory_count': len(linked_memories), 'linked_proposals': linked_proposals, 'proposal_count': len(linked_proposals), 'linked_outputs': linked_outputs, 'output_count': len(linked_outputs), 'latest_output': latest_output, 'relevant_memories': relevant_memories, 'relevant_outputs': relevant_outputs, 'relevant_context_summary': relevant_context_summary, 'linked_adaptations': task_adaptations_list(conn, task_id), 'adaptation_count': task_adaptation_count(conn, task_id), 'latest_adaptation': task_latest_adaptation(conn, task_id)}
 
 
 def task_history_get(task_id: str):
@@ -4028,6 +4738,11 @@ def task_delete(task_id: str):
 def board_list():
     return task_list()
 
+
+def board_summary() -> dict:
+    with connect_board() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    return {"total": int(total)}
 
 
 def board_create(payload: dict):
@@ -6540,6 +7255,7 @@ def runs_cleanup(action: str, *, reseed: bool = False) -> dict:
 
 def run_list(*, task_id: str = '') -> list[dict]:
     with connect_board() as conn:
+        reconcile_stale_running_runs(conn)
         clauses = []
         params = []
         if task_id:
@@ -6556,6 +7272,7 @@ def run_list(*, task_id: str = '') -> list[dict]:
 
 
 def task_runs_list(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    reconcile_stale_running_runs(conn)
     if not task_id:
         return []
     rows = conn.execute(
@@ -6574,6 +7291,7 @@ def run_get(run_id: str):
     if not run_id:
         raise ValueError("id is required")
     with connect_board() as conn:
+        reconcile_stale_running_runs(conn)
         row = conn.execute(RUN_SELECT + " WHERE r.id = ?", (run_id,)).fetchone()
         if row is None:
             raise ResourceNotFoundError('run', run_id)
@@ -7250,8 +7968,7 @@ def snapshot():
         "sessions": safe_call("sessions", sessions_data),
         "vps": safe_call("vps", vps_health),
         "cron": safe_call("cron", cron_jobs),
-        "board": safe_call("board", lambda: {"tasks": board_list()}),
-        "runs": safe_call("runs", lambda: {"items": run_list()}),
+        "kanban": safe_call("kanban", board_summary),
     }
 
 
@@ -7762,7 +8479,7 @@ def graph_data() -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "HermesMissionControl/1.0"
+    server_version = f"{APP_NAME}/1.0"
 
     def log_message(self, fmt, *args):
         print(f"[{datetime.now().isoformat(timespec='seconds')}] {self.address_string()} {fmt % args}")
@@ -7828,6 +8545,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if parsed.path == "/api/status":
+            self.send_json({
+                "ok": True,
+                "status": "ok",
+                "app_name": APP_NAME,
+                "implementation_phase": IMPLEMENTATION_PHASE,
+                "timestamp": utc_now(),
+                "bind": {"host": HOST, "port": PORT},
+            })
             return
         if parsed.path == "/api/snapshot":
             self.send_json(snapshot())
@@ -8065,6 +8792,8 @@ class Handler(BaseHTTPRequestHandler):
             proposal_apply_match = re.fullmatch(r"/api/proposals/([^/]+)/apply", parsed.path)
             task_generate_proposal_match = re.fullmatch(r"/api/tasks/([^/]+)/generate-proposal", parsed.path)
             task_generate_output_match = re.fullmatch(r"/api/tasks/([^/]+)/generate-output", parsed.path)
+            task_complete_from_workspace_match = re.fullmatch(r"/api/tasks/([^/]+)/complete-from-workspace", parsed.path)
+            output_review_match = re.fullmatch(r"/api/task-outputs/([^/]+)/review", parsed.path)
             adaptation_update_match = re.fullmatch(r"/api/adaptations/update", parsed.path)
             if parsed.path == "/api/proposals":
                 self.send_json(proposal_record_create(payload), 201)
@@ -8077,6 +8806,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if task_generate_output_match:
                 self.send_json(generate_task_output(task_generate_output_match.group(1), payload), 201)
+                return
+            if task_complete_from_workspace_match:
+                self.send_json(complete_task_from_workspace(task_complete_from_workspace_match.group(1), payload))
+                return
+            if output_review_match:
+                self.send_json(review_task_output(output_review_match.group(1), payload))
                 return
             if approval_request_match:
                 self.send_json(proposal_request_approval(approval_request_match.group(1), payload))
@@ -8218,7 +8953,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init_board()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Hermes Mission Control serving on http://{HOST}:{PORT}")
+    print(f"{APP_NAME} serving on http://{HOST}:{PORT}")
     httpd.serve_forever()
 
 
