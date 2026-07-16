@@ -107,6 +107,9 @@ A phase is not really done until:
 - Phase: Reset C — Create Work + Planning Profile
 - Branch: `main`
 - Baseline HEAD: `2cd763c feat(agentforge): complete Reset B real execution proof`
+- Reset C implementation commit: `4ab027289d06346a0e559bfb190e2f964ad1102a`
+- Commit message: `feat(agentforge): complete Reset C planning workflow`
+- Push: verified on `origin/main`
 - Backups:
   - `backups/index_vreset-c_2026-07-16T14-27.html`
   - `backups/server_vreset-c_2026-07-16T14-27.py`
