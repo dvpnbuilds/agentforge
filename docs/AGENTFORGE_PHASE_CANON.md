@@ -709,6 +709,7 @@ Verification:
 - plan v2 added the requested explicit AUDIT gate and was approved by DV
 - Kanban task count remained unchanged during approval, proving no Reset D execution tasks were dispatched
 - production API, browser, console, ordinary 28-task history, attachment path, validation, blocked/malformed mapping, idempotency, cancel, retry, and Reset B regressions passed
+- post-review hardening raised coverage to 27/27 tests and closed attachment DELETE routing, mission-owned attachment isolation, verified PLANNING run/profile provenance, installed profile/tool capability snapshots, revision dispatch recovery, canceled-plan resurrection, truthful 404/503 API boundaries, full retry UX, and expandable immutable plan history
 
 Deferred:
 - multi-profile execution of approved plans

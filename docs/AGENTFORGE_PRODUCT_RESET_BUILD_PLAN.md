@@ -237,6 +237,7 @@ Replace manual technical task setup with a calm goal-first intake and a real PLA
 - Browser-submitted revision feedback produced plan v2 through planning task `t_78efbb68`; v1 and feedback remained visible.
 - Plan v2 added an explicit AUDIT gate and was approved; mission state became `queued` with no new Hermes task created during approval.
 - Verification passed: 18 unit tests, Python/JS syntax, API validation/idempotency, attachment path safety, malformed/unsupported/cancel/retry paths, real planner, browser revision/approval, browser console, production runtime, ordinary Tasks history, and Reset B regression.
+- Post-review hardening passed 27/27 tests and added HTTP upload/delete coverage, durable mission attachment ownership, verified PLANNING run/profile provenance, installed profile/tool capability snapshots, same-version dispatch recovery, canceled-plan terminality, 404/503 API boundaries, complete retry-state UI coverage, and expandable prior-plan inspection.
 - Temporary canceled QA mission was removed and its Hermes planning task archived. Successful Reset C proof remains intentionally retained.
 
 **Do not start Reset D without explicit DV authorization.**

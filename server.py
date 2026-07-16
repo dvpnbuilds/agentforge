@@ -23,7 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from mission_service import MissionService
+from hermes_kanban_adapter import KanbanCommandError
+from mission_service import MissionNotFoundError, MissionService
 
 HOST = "127.0.0.1"
 PORT = 50000
@@ -310,6 +311,14 @@ def task_attachment_rows_for_ids(conn: sqlite3.Connection, attachment_ids: list[
     missing = [attachment_id for attachment_id in attachment_ids if attachment_id not in found]
     if missing:
         raise ValueError(f"unknown attachment IDs: {', '.join(missing)}")
+    if existing_table(conn, ['mission_attachments']):
+        placeholders = ','.join(['?'] * len(attachment_ids))
+        owned = conn.execute(
+            f"SELECT attachment_id FROM mission_attachments WHERE attachment_id IN ({placeholders})",
+            attachment_ids,
+        ).fetchall()
+        if owned:
+            raise ValueError('mission-owned attachments cannot be assigned to tasks')
     by_id = {str(row['id']): dict(row) for row in rows}
     return [by_id[attachment_id] for attachment_id in attachment_ids]
 
@@ -325,6 +334,10 @@ def task_attachments_for_task(conn: sqlite3.Connection, task_id: str) -> list[di
 def delete_task_attachment_rows(conn: sqlite3.Connection, rows):
     for row in rows or []:
         item = dict(row)
+        if item.get('id') and existing_table(conn, ['mission_attachments']):
+            owner = conn.execute('SELECT mission_id FROM mission_attachments WHERE attachment_id = ?', (str(item['id']),)).fetchone()
+            if owner:
+                raise ValueError('mission-owned attachments cannot be deleted by task flows')
         if item.get('storage_rel_path'):
             delete_task_attachment_file(str(item.get('storage_rel_path') or ''))
         if item.get('id'):
@@ -333,6 +346,8 @@ def delete_task_attachment_rows(conn: sqlite3.Connection, rows):
 
 def sync_task_attachments(conn: sqlite3.Connection, task_id: str, attachment_ids: list[str], draft_token: str = ''):
     keep_ids = [attachment_id for attachment_id in attachment_ids if attachment_id]
+    if keep_ids:
+        task_attachment_rows_for_ids(conn, keep_ids)
     keep_set = set(keep_ids)
     current_rows = conn.execute('SELECT * FROM task_attachments WHERE task_id = ? ORDER BY uploaded_at ASC, created_at ASC', (task_id,)).fetchall()
     delete_task_attachment_rows(conn, [row for row in current_rows if str(row['id']) not in keep_set])
@@ -6605,6 +6620,10 @@ def api_error_payload(message: str, *, code: str, boundary: str, details: dict |
 
 
 def exception_to_api_error(exc: Exception, *, fallback_boundary: str = 'request_error', fallback_code: str = 'bad_request') -> tuple[int, dict]:
+    if isinstance(exc, MissionNotFoundError):
+        return 404, api_error_payload(str(exc), code='mission_not_found', boundary='not_found')
+    if isinstance(exc, KanbanCommandError):
+        return 503, api_error_payload(str(exc), code='hermes_unavailable', boundary='hermes_transport')
     if isinstance(exc, ResourceNotFoundError):
         return 404, api_error_payload(
             str(exc),
@@ -8962,8 +8981,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         parsed = urlparse(self.path)
         task_match = re.fullmatch(r"/api/tasks/([^/]+)", parsed.path)
+        task_attachment_match = re.fullmatch(r"/api/task-attachments/([^/]+)", parsed.path)
         deployment_match = re.fullmatch(r"/api/deployments/([^/]+)", parsed.path)
-        if not task_match and not deployment_match:
+        if not task_match and not task_attachment_match and not deployment_match:
             self.send_error(404, "not found")
             return
         try:

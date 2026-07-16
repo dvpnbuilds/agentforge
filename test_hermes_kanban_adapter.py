@@ -47,6 +47,19 @@ class HermesKanbanAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(KanbanCommandError, 'timed out'):
             adapter.list_tasks()
 
+    def test_installed_profiles_are_read_from_supported_profile_cli(self):
+        output = "Profile Model Gateway\n  assistant gpt stopped\n ◆master gpt running\n  planning gpt stopped\n  research gpt stopped\n"
+        adapter, runner = self.make_adapter(subprocess.CompletedProcess([], 0, stdout=output, stderr=''))
+        self.assertEqual(adapter.installed_profiles(), {'assistant', 'master', 'planning', 'research'})
+        self.assertEqual(runner.call_args.args[0], ['hermes', 'profile', 'list'])
+
+    def test_available_plan_tools_are_read_from_enabled_cli_toolsets(self):
+        output = "Built-in toolsets (cli):\n  ✓ enabled  web  Web\n  ✓ enabled  browser  Browser\n  ✓ enabled  terminal  Terminal\n  ✓ enabled  file  Files\n  ✗ disabled video Video\n"
+        adapter, runner = self.make_adapter(subprocess.CompletedProcess([], 0, stdout=output, stderr=''))
+        tools = adapter.available_plan_tools()
+        self.assertTrue({'none', 'web', 'browser', 'terminal', 'file'}.issubset(tools))
+        self.assertEqual(runner.call_args.args[0], ['hermes', 'tools', 'list', '--platform', 'cli'])
+
     def test_malformed_json_is_rejected(self):
         adapter, _ = self.make_adapter(subprocess.CompletedProcess([], 0, stdout='not-json', stderr=''))
         with self.assertRaisesRegex(KanbanCommandError, 'malformed JSON'):

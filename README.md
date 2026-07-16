@@ -55,6 +55,8 @@ The Tasks screen now defaults to a calm goal-first Create Work path:
 - desired outcome and success criteria are required; context, links, attachments, priority, and deadline are supported
 - a real Hermes `planning` task proposes a strict server-validated specialist workflow
 - plans show profile ownership, scoped responsibilities, outputs, dependencies, evidence/tool requirements, final deliverable, and HUMAN/AUDIT gates
+- completed planner output requires a successful real `planning` run, and validated plans retain an installed-profile/enabled-tool capability snapshot
+- mission-owned context files are isolated from ordinary task assignment and deletion flows
 - malformed or unsupported plans fail visibly and can be retried
 - revision feedback creates a new planning task while preserving previous plan versions
 - `Start` approves the plan only; no specialist execution task is created until Reset D

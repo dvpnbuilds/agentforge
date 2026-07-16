@@ -5,6 +5,8 @@ AgentForge uses this module instead of writing Hermes Kanban SQLite state direct
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 from typing import Any, Callable
 
@@ -109,6 +111,55 @@ class HermesKanbanAdapter:
 
     def list_tasks(self) -> Any:
         return self._run("list", "--archived")
+
+    def installed_profiles(self) -> set[str]:
+        """Return persistent Hermes profiles visible through the supported CLI."""
+        try:
+            result = self.runner(
+                ["hermes", "profile", "list"],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise KanbanCommandError(f"Hermes profile list timed out after {self.timeout}s") from exc
+        if result.returncode != 0:
+            detail = str(result.stderr or result.stdout or f"exit {result.returncode}").strip()
+            raise KanbanCommandError(f"Hermes profile list failed: {detail[:2000]}")
+        profiles: set[str] = set()
+        for line in str(result.stdout or "").splitlines():
+            match = re.match(r"\s*[◆*]?\s*([a-z][a-z0-9_-]{0,63})\s+", line.lower())
+            if match and match.group(1) not in {"profile"}:
+                profiles.add(match.group(1))
+        if not profiles:
+            raise KanbanCommandError("Hermes profile list returned no parseable profiles")
+        return profiles
+
+    def available_plan_tools(self) -> set[str]:
+        """Map enabled Hermes CLI toolsets to Reset C's plan vocabulary."""
+        try:
+            result = self.runner(
+                ["hermes", "tools", "list", "--platform", "cli"],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise KanbanCommandError(f"Hermes tools list timed out after {self.timeout}s") from exc
+        if result.returncode != 0:
+            detail = str(result.stderr or result.stdout or f"exit {result.returncode}").strip()
+            raise KanbanCommandError(f"Hermes tools list failed: {detail[:2000]}")
+        enabled = {
+            match.group(1)
+            for line in str(result.stdout or "").splitlines()
+            if (match := re.match(r"\s*✓\s+enabled\s+([a-z][a-z0-9_-]*)\b", line.lower()))
+        }
+        tools = {"none"} | ({"web", "browser", "terminal", "file"} & enabled)
+        if "terminal" in enabled and (shutil.which("gh") or shutil.which("git")):
+            tools.add("github")
+        return tools
 
     def show_task(self, task_id: str) -> dict:
         payload = self._run("show", self._require_id(task_id))

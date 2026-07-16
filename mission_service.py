@@ -50,6 +50,10 @@ class PlanValidationError(ValueError):
     """Planner result is readable but does not satisfy the Reset C contract."""
 
 
+class MissionNotFoundError(LookupError):
+    """Requested AgentForge mission does not exist."""
+
+
 class MissionService:
     DEFAULT_PROFILE = "planning"
     RESEARCH_PROFILE = "research"
@@ -159,10 +163,17 @@ class MissionService:
                   UNIQUE(mission_id, version),
                   FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS mission_attachments (
+                  attachment_id TEXT PRIMARY KEY,
+                  mission_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE CASCADE
+                );
                 CREATE INDEX IF NOT EXISTS idx_missions_state ON missions(state, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_mission_artifacts_mission ON mission_artifacts(mission_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_mission_reviews_mission ON mission_reviews(mission_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_execution_plans_mission ON execution_plans(mission_id, version DESC);
+                CREATE INDEX IF NOT EXISTS idx_mission_attachments_mission ON mission_attachments(mission_id);
                 """
             )
             self._ensure_columns(
@@ -176,6 +187,23 @@ class MissionService:
                     "plan_status": "TEXT NOT NULL DEFAULT ''",
                 },
             )
+            self._ensure_columns(
+                conn,
+                "execution_plans",
+                {"capabilities_json": "TEXT NOT NULL DEFAULT '{}'"},
+            )
+            for row in conn.execute("SELECT id,attachments_json,created_at FROM missions WHERE attachments_json <> '[]'").fetchall():
+                try:
+                    attachments = json.loads(str(row["attachments_json"] or "[]"))
+                except json.JSONDecodeError:
+                    attachments = []
+                for attachment in attachments if isinstance(attachments, list) else []:
+                    attachment_id = str(json_object(attachment).get("id") or "").strip()
+                    if attachment_id:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO mission_attachments (attachment_id,mission_id,created_at) VALUES (?,?,?)",
+                            (attachment_id, row["id"], row["created_at"]),
+                        )
             conn.commit()
 
     @staticmethod
@@ -249,6 +277,27 @@ class MissionService:
         )
         return attachments
 
+    def _validated_mission_attachments(self, mission: dict) -> list[dict]:
+        attachments = mission.get("attachments") or []
+        if not attachments:
+            return []
+        with self.connect() as conn:
+            for item in attachments:
+                attachment_id = str(json_object(item).get("id") or "").strip()
+                owner = conn.execute(
+                    "SELECT 1 FROM mission_attachments WHERE attachment_id=? AND mission_id=?",
+                    (attachment_id, mission["id"]),
+                ).fetchone()
+                row = conn.execute("SELECT storage_rel_path FROM task_attachments WHERE id=?", (attachment_id,)).fetchone()
+                if not owner or not row:
+                    raise ValueError(f"mission attachment is unavailable: {attachment_id or 'missing'}")
+                upload_root = (self.db_path.parent / "task_uploads").resolve()
+                rel = Path(str(row["storage_rel_path"] or ""))
+                path = (self.db_path.parent / rel if rel.parts and rel.parts[0] == "task_uploads" else upload_root / rel).resolve()
+                if not path.is_relative_to(upload_root) or not path.is_file():
+                    raise ValueError(f"attachment path is unavailable: {json_object(item).get('filename') or attachment_id}")
+        return attachments
+
     def create_mission(self, payload: dict | None) -> dict:
         payload = dict(payload or {})
         desired_outcome = str(payload.get("desired_outcome") or payload.get("desiredOutcome") or "").strip()
@@ -300,6 +349,10 @@ class MissionService:
                     now,
                     now,
                 ),
+            )
+            conn.executemany(
+                "INSERT INTO mission_attachments (attachment_id,mission_id,created_at) VALUES (?,?,?)",
+                [(str(item["id"]), mission_id, now) for item in attachments],
             )
             conn.commit()
         try:
@@ -386,29 +439,22 @@ class MissionService:
 
     def _dispatch_planning_task(self, mission_id: str, *, version: int, feedback: str = "") -> None:
         mission = self.get_mission(mission_id)
-        step_id = uuid.uuid4().hex
         now = utc_now()
         step_key = f"planning-v{version}"
         hermes_key = f"agentforge:{mission_id}:{step_key}:1"
         responsibility = "Design and validate the specialist workflow proposal. Do not execute the downstream work."
+        attachments = self._validated_mission_attachments(mission)
         with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO mission_steps (id,mission_id,step_key,profile,responsibility,expected_output,hermes_board,idempotency_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (
-                    step_id,
-                    mission_id,
-                    step_key,
-                    self.PLANNING_PROFILE,
-                    responsibility,
-                    "One strict JSON workflow proposal that passes the AgentForge Reset C schema.",
-                    self.BOARD,
-                    hermes_key,
-                    now,
-                    now,
-                ),
-            )
+            existing = conn.execute("SELECT id FROM mission_steps WHERE mission_id=? AND step_key=?", (mission_id, step_key)).fetchone()
+            step_id = str(existing["id"]) if existing else uuid.uuid4().hex
+            if not existing:
+                conn.execute(
+                    "INSERT INTO mission_steps (id,mission_id,step_key,profile,responsibility,expected_output,hermes_board,idempotency_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (step_id, mission_id, step_key, self.PLANNING_PROFILE, responsibility,
+                     "One strict JSON workflow proposal that passes the AgentForge Reset C schema.",
+                     self.BOARD, hermes_key, now, now),
+                )
             conn.commit()
-        attachments = mission.get("attachments") or []
         attachment_lines = "\n".join(f"- {item['filename']}: {item['path']}" for item in attachments) or "- None"
         revision_section = f"\nRevision feedback from DV:\n{feedback}\n" if feedback else ""
         body = (
@@ -523,6 +569,9 @@ class MissionService:
 
     def validate_plan(self, raw: str) -> dict:
         plan = self._planner_json(raw)
+        installed_profiles = set(self.adapter.installed_profiles())
+        available_profiles = self.ALLOWED_PLAN_PROFILES & installed_profiles
+        available_tools = self.ALLOWED_PLAN_TOOLS & set(self.adapter.available_plan_tools())
         required = {"rationale", "final_deliverable", "steps", "gates"}
         unknown = set(plan) - required
         missing = required - set(plan)
@@ -562,19 +611,24 @@ class MissionService:
             raw_step["key"] = key
             keys.append(key)
             profile = str(raw_step["profile"] or "").strip().lower()
-            if profile not in self.ALLOWED_PLAN_PROFILES:
+            if profile not in available_profiles:
                 raise PlanValidationError(f"step {key} uses unsupported profile: {profile or 'missing'}")
             raw_step["profile"] = profile
-            for field in ("title", "responsibility", "expected_output"):
-                if not isinstance(raw_step[field], str) or not raw_step[field].strip() or len(raw_step[field]) > 3000:
+            for field, max_length in (("title", 300), ("responsibility", 2000), ("expected_output", 2000)):
+                if not isinstance(raw_step[field], str) or not raw_step[field].strip() or len(raw_step[field]) > max_length:
                     raise PlanValidationError(f"step {key} {field} must be a non-empty string")
                 raw_step[field] = raw_step[field].strip()
-            for field in ("dependencies", "evidence_requirements", "tool_requirements"):
+            list_limits = {"dependencies": (12, 64), "evidence_requirements": (12, 1000), "tool_requirements": (8, 64)}
+            for field, (max_items, max_length) in list_limits.items():
                 if not isinstance(raw_step[field], list) or any(not isinstance(item, str) for item in raw_step[field]):
                     raise PlanValidationError(f"step {key} {field} must be a string list")
                 raw_step[field] = [item.strip() for item in raw_step[field] if item.strip()]
+                if len(raw_step[field]) > max_items or any(len(item) > max_length for item in raw_step[field]):
+                    raise PlanValidationError(f"step {key} {field} exceeds safety limits")
+                if len(set(raw_step[field])) != len(raw_step[field]):
+                    raise PlanValidationError(f"step {key} has duplicate {field}")
             tools = set(raw_step["tool_requirements"])
-            unsupported_tools = tools - self.ALLOWED_PLAN_TOOLS
+            unsupported_tools = tools - available_tools
             if unsupported_tools:
                 raise PlanValidationError(f"step {key} uses unsupported tool: {', '.join(sorted(unsupported_tools))}")
         key_set = set(keys)
@@ -604,7 +658,7 @@ class MissionService:
         for node in graph:
             visit(node)
         gates = plan["gates"]
-        if not isinstance(gates, list) or not gates:
+        if not isinstance(gates, list) or not 1 <= len(gates) <= 12:
             raise PlanValidationError("gates must contain at least one human gate")
         for index, gate in enumerate(gates, start=1):
             if not isinstance(gate, dict) or set(gate) != {"type", "description"}:
@@ -612,12 +666,20 @@ class MissionService:
             gate_type = str(gate["type"] or "").strip().lower()
             if gate_type not in {"human", "audit"}:
                 raise PlanValidationError(f"gate {index} uses unsupported type: {gate_type or 'missing'}")
-            if not isinstance(gate["description"], str) or not gate["description"].strip():
+            if not isinstance(gate["description"], str) or not gate["description"].strip() or len(gate["description"]) > 1000:
                 raise PlanValidationError(f"gate {index} description is required")
             gate["type"] = gate_type
             gate["description"] = gate["description"].strip()
         if not any(gate["type"] == "human" for gate in gates):
             raise PlanValidationError("plan requires at least one human gate")
+        if len(json.dumps(plan, ensure_ascii=False).encode("utf-8")) > 100_000:
+            raise PlanValidationError("normalized plan exceeds 100000-byte safety limit")
+        plan["_capability_snapshot"] = {
+            "installed_profiles": sorted(installed_profiles),
+            "allowed_profiles": sorted(available_profiles),
+            "available_tools": sorted(available_tools),
+            "validated_at": utc_now(),
+        }
         return plan
 
     def sync_mission(self, mission_id: str) -> dict:
@@ -644,17 +706,26 @@ class MissionService:
             operator_message = block_reason or "PLANNING is blocked and needs operator input."
             plan_status = "blocked"
         elif status in {"done", "review"}:
-            raw = self._artifact_content(task, latest_run)
-            try:
-                plan = self.validate_plan(raw)
-                self._upsert_plan(mission, plan, raw, task, latest_run)
-                state = "planning"
-                plan_status = "proposed"
-                operator_message = f"Workflow proposal v{mission['planning_version']} is validated and waiting for DV."
-            except PlanValidationError as exc:
+            run_id = str(latest_run.get("id") or latest_run.get("run_id") or "").strip()
+            run_profile = str(latest_run.get("profile") or "").strip().lower()
+            run_status = str(latest_run.get("status") or "").strip().lower()
+            run_outcome = str(latest_run.get("outcome") or "").strip().lower()
+            if not run_id or run_profile != self.PLANNING_PROFILE or run_status not in {"done", "success", "completed"} or run_outcome not in {"completed", "success"}:
                 state = "failed"
-                plan_status = "invalid"
-                operator_message = f"Planner output failed validation: {exc}. Retry planning safely."
+                plan_status = "provenance_invalid"
+                operator_message = "Planner result lacks a verified successful Hermes PLANNING run. Retry planning safely."
+            else:
+                raw = self._artifact_content(task, latest_run)
+                try:
+                    plan = self.validate_plan(raw)
+                    self._upsert_plan(mission, plan, raw, task, latest_run)
+                    state = "planning"
+                    plan_status = "proposed"
+                    operator_message = f"Workflow proposal v{mission['planning_version']} is validated and waiting for DV."
+                except PlanValidationError as exc:
+                    state = "failed"
+                    plan_status = "invalid"
+                    operator_message = f"Planner output failed validation: {exc}. Retry planning safely."
         elif status in {"running", "claimed"}:
             state = "planning"
             plan_status = "planning"
@@ -678,6 +749,7 @@ class MissionService:
 
     def _upsert_plan(self, mission: dict, plan: dict, raw: str, task: dict, run: dict) -> None:
         now = utc_now()
+        capabilities = plan.pop("_capability_snapshot", {})
         version = int(mission.get("planning_version") or 1)
         with self.connect() as conn:
             existing = conn.execute(
@@ -703,16 +775,17 @@ class MissionService:
                 str(existing["reviewed_at"] or "") if existing else "",
                 str(existing["created_at"] or now) if existing else now,
                 now,
+                json.dumps(capabilities),
             )
             conn.execute(
                 """INSERT INTO execution_plans
-                (id,mission_id,version,status,rationale,final_deliverable,plan_json,raw_planner_output,planner_task_id,planner_run_id,planner_profile,revision_feedback,reviewer,reviewed_at,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (id,mission_id,version,status,rationale,final_deliverable,plan_json,raw_planner_output,planner_task_id,planner_run_id,planner_profile,revision_feedback,reviewer,reviewed_at,created_at,updated_at,capabilities_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(mission_id,version) DO UPDATE SET
                   status=excluded.status,rationale=excluded.rationale,final_deliverable=excluded.final_deliverable,
                   plan_json=excluded.plan_json,raw_planner_output=excluded.raw_planner_output,
                   planner_task_id=excluded.planner_task_id,planner_run_id=excluded.planner_run_id,
-                  planner_profile=excluded.planner_profile,updated_at=excluded.updated_at""",
+                  planner_profile=excluded.planner_profile,capabilities_json=excluded.capabilities_json,updated_at=excluded.updated_at""",
                 values,
             )
             conn.commit()
@@ -734,6 +807,8 @@ class MissionService:
                 raise ValueError("a validated current plan is required before Start")
             if current_plan["status"] == "approved":
                 return mission
+            if mission["state"] != "planning" or mission["plan_status"] != "proposed" or current_plan["status"] != "proposed":
+                raise ValueError("Start is available only for the current proposed plan")
             with self.connect() as conn:
                 conn.execute(
                     "UPDATE execution_plans SET status='approved', reviewer=?, reviewed_at=?, updated_at=? WHERE id=?",
@@ -762,7 +837,10 @@ class MissionService:
                     (new_version, "Dispatching a versioned planning revision.", now, mission_id),
                 )
                 conn.commit()
-            self.adapter.comment(mission["hermes_task_id"], f"AgentForge requested plan revision: {feedback[:4500]}")
+            try:
+                self.adapter.comment(mission["hermes_task_id"], f"AgentForge requested plan revision: {feedback[:4500]}")
+            except Exception:
+                pass
             try:
                 self._dispatch_planning_task(mission_id, version=new_version, feedback=feedback[:5000])
             except Exception as exc:
@@ -775,9 +853,11 @@ class MissionService:
                 raise
             return self.get_mission(mission_id)
         if action == "retry":
-            if mission["plan_status"] not in {"invalid", "failed", "dispatch_failed"}:
+            if mission["plan_status"] not in {"invalid", "failed", "dispatch_failed", "provenance_invalid"}:
                 raise ValueError("retry is available only after planning failure")
-            new_version = int(mission["planning_version"] or 0) + 1
+            new_version = int(mission["planning_version"] or 1)
+            if mission["plan_status"] != "dispatch_failed":
+                new_version += 1
             with self.connect() as conn:
                 conn.execute(
                     "UPDATE missions SET state='dispatching', plan_status='planning', planning_version=?, operator_message=?, updated_at=? WHERE id=?",
@@ -947,7 +1027,7 @@ class MissionService:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM missions WHERE id=?", (str(mission_id or ""),)).fetchone()
             if not row:
-                raise KeyError("mission not found")
+                raise MissionNotFoundError("mission not found")
             mission = dict(row)
             steps = [dict(item) for item in conn.execute("SELECT * FROM mission_steps WHERE mission_id=? ORDER BY created_at", (mission_id,)).fetchall()]
             artifacts = []
@@ -961,6 +1041,7 @@ class MissionService:
             for item in conn.execute("SELECT * FROM execution_plans WHERE mission_id=? ORDER BY version DESC", (mission_id,)).fetchall():
                 plan_row = dict(item)
                 parsed = json.loads(plan_row.pop("plan_json") or "{}")
+                plan_row["capabilities"] = json.loads(plan_row.pop("capabilities_json", "{}") or "{}")
                 plan_row["steps"] = parsed.get("steps") or []
                 plan_row["gates"] = parsed.get("gates") or []
                 plans.append(plan_row)

@@ -122,3 +122,13 @@ A phase is not really done until:
 - Gateway: not restarted
 - Deferred: all Reset D+ execution, automatic audit routing, Vault learning, workflow reuse, JobForge reference flow, and final hardening
 - Next: Reset D is planned but requires explicit DV authorization; do not start automatically
+
+### Post-review hardening — 2026-07-16
+- Closed the delayed reviewer findings before Reset D.
+- Attachment upload/delete now has real HTTP-handler coverage; mission-owned files cannot be hijacked or deleted by task flows.
+- Revision comments are best-effort, failed revision dispatch retries the same durable version, and canceled proposed plans cannot be resurrected.
+- Completed planner output now requires a successful Hermes run ID from the real `planning` profile before plan persistence.
+- Validation intersects AgentForge's allowlists with installed Hermes profiles and enabled CLI toolsets, then persists the capability snapshot.
+- Missing missions return `404`; Hermes transport failures return `503` while preserving recoverable mission state.
+- Retry controls cover every supported failure state; prior plan versions expand to show immutable rationale, stages, gates, and revision feedback.
+- Verification: 27/27 unit + HTTP integration tests, Python/inline-JavaScript syntax, production API, browser, retained real-plan proof, and ordinary-task regression passed.
