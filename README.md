@@ -1,6 +1,12 @@
 # AgentForge
 
-AgentForge is a local task-centered workforce OS for Hermes operations.
+AgentForge is the supervised workflow and memory layer for a persistent team of Hermes specialists.
+
+The user creates work by describing an outcome. AgentForge plans the specialist workflow, routes durable execution through Hermes, returns the artifact for human review, and turns approved feedback into trusted Vault knowledge and reusable versioned workflows.
+
+Current product reset contract: [`docs/AGENTFORGE_PRODUCT_RESET_A.md`](docs/AGENTFORGE_PRODUCT_RESET_A.md)
+
+DEV-ready phase plan: [`docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`](docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md)
 
 ## Verified current surface
 
@@ -11,6 +17,37 @@ AgentForge is a local task-centered workforce OS for Hermes operations.
 - **Agents, Playbooks, and Deployments** have live API-backed surfaces.
 - **AI Ops / snapshot view** is fed by gateway, cron, session, VPS, and kanban snapshot data.
 - **Vault library and knowledge graph** are present.
+
+These surfaces remain the existing foundation. Reset B now adds one deliberately narrow real-execution spine without pretending the full multi-profile product is complete.
+
+## Reset B — verified real execution proof
+
+The Tasks screen now includes a `Create Work` proof path for research-shaped missions:
+
+- mission intent, success criteria, and context persist in AgentForge
+- `hermes_kanban_adapter.py` creates and reads a durable task on Hermes board `agentforge`
+- the task is assigned to the real `research` profile
+- Hermes Kanban remains execution truth; AgentForge stores mapping, artifact, review, and attention state
+- a completed Hermes result becomes a provenance-bearing AgentForge artifact
+- blocked work maps to `Needs Input` without a fabricated artifact
+- approve/revision decisions persist against that artifact
+
+Verified proof retained for DV/AUDIT inspection:
+
+- AgentForge mission: `82661edd618c484a96c7fe11bb3bf787`
+- Hermes task: `t_ebee2065`
+- Hermes board/profile/run: `agentforge` / `research` / `2`
+- real sources: `python.org/downloads/` and the Python `3.14.6` release page
+- human state: approved / completed
+
+API surfaces:
+
+- `GET|POST /api/missions`
+- `GET /api/missions/:id`
+- `POST /api/missions/:id/sync`
+- `POST /api/missions/:id/review`
+
+Reset C is planned but is **not authorized or started automatically**. Output Intelligence V2 remains superseded by the Product Reset roadmap.
 
 ## Runtime
 
@@ -31,5 +68,7 @@ The app binds to `127.0.0.1:50000` by default.
 ## Repo notes
 
 - Main continuity doc: `docs/AGENTFORGE_PHASE_CANON.md`
+- Product Reset A contract: `docs/AGENTFORGE_PRODUCT_RESET_A.md`
+- Reset B–I DEV build plan: `docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
 - Timestamped backups live under `backups/`
 - Local databases, caches, backups, and environment files are intentionally not committed

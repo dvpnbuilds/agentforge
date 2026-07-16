@@ -20,6 +20,12 @@ Expected main live files:
 - `/root/agentforge/index.html`
 - `/root/agentforge/server.py`
 
+For the Product Reset track, read before implementation:
+- `/root/agentforge/docs/AGENTFORGE_PRODUCT_RESET_A.md`
+- `/root/agentforge/docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
+
+Execute only the confirmed next Reset phase. Do not combine phases or advance automatically.
+
 ### 3) Verify for real
 Minimum verification:
 - `python3 -m py_compile /root/agentforge/server.py`
@@ -34,6 +40,7 @@ Minimum verification:
 ### 4) Update canon immediately
 Update:
 - `/root/agentforge/docs/AGENTFORGE_PHASE_CANON.md`
+- `/root/agentforge/docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md` when a Reset phase status changes
 
 Must update these sections:
 - `Current implementation sequence`
@@ -74,3 +81,21 @@ A phase is not really done until:
 3. canon file is updated
 4. git commit/push is done
 5. handoff summary is written
+
+---
+
+## Latest handoff — Reset B (2026-07-16)
+
+- Phase: Reset B — Real Single-Profile Execution Proof
+- Branch: `main`
+- Baseline HEAD: `b8a0ffa Close out Phase 19 stabilization and add runtime health check`
+- Backups:
+  - `backups/index_vreset-b_2026-07-16T13-51.html`
+  - `backups/server_vreset-b_2026-07-16T13-51.py`
+- Runtime: `agentforge.service` active on `127.0.0.1:50000`
+- Proof mission/task/run: `82661edd618c484a96c7fe11bb3bf787` / `t_ebee2065` / research run `2`
+- Verification: 10 unit tests, Python/JS syntax, API idempotency, real worker, blocked path, invalid profile, human review persistence, browser/console, existing Tasks regression, and linked-output deletion cleanup all passed
+- Cleanup: blocked fixture mission removed, blocked Hermes task archived, deletion fixture task/output/runs removed; successful proof retained for inspection
+- Gateway: not restarted
+- Deferred: every Reset C+ capability
+- Next: Reset C is planned but requires explicit DV authorization; do not start automatically

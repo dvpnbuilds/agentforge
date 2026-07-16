@@ -23,11 +23,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from mission_service import MissionService
+
 HOST = "127.0.0.1"
 PORT = 50000
 STALE_RUNNING_RUN_MAX_AGE_SECONDS = 12 * 60 * 60
 APP_NAME = "AgentForge"
-IMPLEMENTATION_PHASE = "Phase 19 stabilization / closeout"
+IMPLEMENTATION_PHASE = "Reset B — Real Single-Profile Execution Proof"
 PROJECT_DIR = Path(__file__).resolve().parent
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/root/.hermes"))
 LIBRARY_ROOT = Path("/root/.hermes/content")
@@ -36,6 +38,7 @@ LIBRARY_AGENTS = ["master", "assistant", "research", "planning", "audit", "dev"]
 AGENT_LOGS_DB = HERMES_HOME / "agent-logs.db"
 STATE_DB = HERMES_HOME / "state.db"
 BOARD_DB = PROJECT_DIR / "board.db"
+MISSION_SERVICE = MissionService(BOARD_DB)
 TASK_ATTACHMENTS_DIR = PROJECT_DIR / "task_uploads"
 TASK_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 TASK_ATTACHMENT_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx", ".rtf", ".odt"}
@@ -8559,6 +8562,16 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/snapshot":
             self.send_json(snapshot())
             return
+        mission_match = re.fullmatch(r"/api/missions/([^/]+)", parsed.path)
+        if parsed.path == "/api/missions":
+            self.send_json({"missions": MISSION_SERVICE.list_missions()})
+            return
+        if mission_match:
+            try:
+                self.send_json({"mission": MISSION_SERVICE.get_mission(mission_match.group(1))})
+            except Exception as exc:
+                self.send_api_error(exc, fallback_boundary='mission_detail_failed', fallback_code='mission_detail_failed')
+            return
         task_history_match = re.fullmatch(r"/api/tasks/([^/]+)/history", parsed.path)
         task_runs_match = re.fullmatch(r"/api/tasks/([^/]+)/runs", parsed.path)
         task_memories_match = re.fullmatch(r"/api/tasks/([^/]+)/memories", parsed.path)
@@ -8777,6 +8790,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({'attachment': attachment}, 201)
                 return
             payload = self.read_payload()
+            mission_sync_match = re.fullmatch(r"/api/missions/([^/]+)/sync", parsed.path)
+            mission_review_match = re.fullmatch(r"/api/missions/([^/]+)/review", parsed.path)
+            if parsed.path == "/api/missions":
+                self.send_json({"mission": MISSION_SERVICE.create_mission(payload)}, 201)
+                return
+            if mission_sync_match:
+                self.send_json({"mission": MISSION_SERVICE.sync_mission(mission_sync_match.group(1))})
+                return
+            if mission_review_match:
+                self.send_json({"mission": MISSION_SERVICE.review_mission(mission_review_match.group(1), payload)})
+                return
             if parsed.path == "/api/board":
                 self.send_json({"task": board_create(payload)}, 201)
                 return
@@ -8952,6 +8976,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_board()
+    MISSION_SERVICE.init_schema()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"{APP_NAME} serving on http://{HOST}:{PORT}")
     httpd.serve_forever()

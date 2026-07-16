@@ -1,30 +1,36 @@
 # AgentForge Phase Canon
 
-Last updated: 2026-07-06
+Last updated: 2026-07-16
 Purpose: continuity anchor for AgentForge whenever chat context drifts, compression fails, or DEV/PLANNING/AUDIT need one trusted source.
 
 ---
 
 ## 1) Product canon
 
-AgentForge is a **task-centered workforce OS**.
+AgentForge is a **supervised adaptive workflow system for a persistent team of Hermes specialists**.
 
 Primary product goal:
-- make tasks actually finishable inside AgentForge
-- each task should be able to produce the **right output**, not just hold notes or status
-- each task should also surface **useful suggestions/proposals** that improve the work, the output, or the next step
-- the app should help the operator go from task intake -> execution -> output -> review -> suggestion -> approval -> applied improvement inside one shared workflow
+- the user describes the desired outcome through `Create Work`
+- AgentForge organizes the request into a visible workflow, selects the right Hermes profiles, scopes what each worker must do, and coordinates their handoffs
+- real Hermes profiles execute durable work instead of AgentForge simulating execution
+- independent research, production, audit, and human-review stages reduce unsupported claims and make missing context visible
+- human feedback corrects the current result and can propose approved lessons, trusted Vault memory, or a versioned workflow improvement
+- once the human is satisfied, the successful process can become a reusable workflow
 
 Main mental model:
-- Tasks is the entry point
-- Kanban is the operational view of the same task system
-- a task is not just a card and not just a chat
-- a task is a **managed work object with a live thread**
-- runs, audit, memory, and proposals support that same task
+- one user request becomes a **mission**
+- a mission has a generated execution plan made of scoped specialist steps
+- Hermes Kanban is the durable execution substrate
+- AgentForge is the operator-facing planning, supervision, review, artifact, reusable-workflow, and memory layer
+- only approved facts, lessons, artifacts, and workflow changes enter trusted organizational memory
 
 Simple version:
-- normal users get a friendly task workflow
-- developers/operators can open deeper controls when needed
+- Claude Cowork and ChatGPT can help complete individual tasks
+- AgentForge runs a repeatable work process, preserves what was learned, and improves the next run under human approval
+
+Approved reset specification:
+- `docs/AGENTFORGE_PRODUCT_RESET_A.md`
+- DEV-ready phased roadmap: `docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
 
 ---
 
@@ -620,21 +626,88 @@ Deferred:
 - tighter proposal-assisted revision flows beyond manual operator control
 - deeper multi-step delegation/adaptation orchestration
 
-Next recommended phase:
+Historical next recommendation, now superseded:
 - Implementation Phase 20 — Output Intelligence V2
-- Phase 19 made the completion loop real; the next highest-leverage gap is improving output quality and proposal usefulness so the operator needs less manual cleanup before marking work complete
+- superseded on 2026-07-16 after the product-usefulness audit showed that improving the heuristic output layer would deepen the wrong execution path before real Hermes work became the product center
+
+### Product Reset A — Supervised Adaptive Workflow Re-anchor
+Status: product direction approved on 2026-07-16; Reset B implementation now complete
+
+Decision:
+- preserve the existing task, review, memory, and history foundation
+- replace the old task-management center with `Create Work -> generated workflow -> real Hermes execution -> human review/revision -> approved learning -> reusable workflow`
+- use Hermes Kanban as the intended execution substrate rather than maintaining a second independent AgentForge execution state machine
+- make the Knowledge Vault a trusted approved-memory layer, not a dump of raw generated output
+- use the JobForge Application Pack as the recommended first real reference workflow
+
+Continuity artifact:
+- `docs/AGENTFORGE_PRODUCT_RESET_A.md`
+- `docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
+
+### Product Reset B — Real Single-Profile Execution Proof
+Status: **confirmed complete**
+Date: 2026-07-16
+
+Changed files:
+- `/root/agentforge/hermes_kanban_adapter.py`
+- `/root/agentforge/mission_service.py`
+- `/root/agentforge/server.py`
+- `/root/agentforge/index.html`
+- `/root/agentforge/test_hermes_kanban_adapter.py`
+- `/root/agentforge/test_mission_service.py`
+
+What shipped:
+- a safe argument-array adapter over supported `hermes kanban ... --json` commands on board `agentforge`
+- durable AgentForge mission, step, artifact, and human-review persistence with Hermes task/run provenance
+- a narrow research-only `Create Work` path with real Hermes state synchronization
+- visible `Needs Input`, `Needs Review`, revision, completed, and failed attention states
+- real artifact/source display and human approve/revision actions tied to the returned artifact
+
+Routes / data changes:
+- `GET|POST /api/missions`
+- `GET /api/missions/:id`
+- `POST /api/missions/:id/sync`
+- `POST /api/missions/:id/review`
+- `missions`, `mission_steps`, `mission_artifacts`, and `mission_reviews` tables in AgentForge-owned `board.db`
+
+Verification:
+- 10 adapter/service unit tests pass
+- Python compile and extracted inline-JavaScript syntax checks pass
+- idempotent API creation returned one mission and one Hermes task
+- real gateway-dispatched research run `2` completed task `t_ebee2065` with official Python.org sources and tool evidence
+- blocked-path QA produced `Needs Input` and zero artifacts; invalid profile produced HTTP `422`
+- human approval persisted and repeated synchronization preserved `completed`
+- main-port browser QA passed with zero JavaScript errors
+- existing Tasks history remained visible and the pre-existing linked-output task deletion cleanup passed a create/output/delete regression
+- temporary QA mission/task/run/output records were removed or archived; successful proof retained
+
+Operational note:
+- the first worker attempt exposed missing research-profile Codex auth; profile-local auth was restored from the already-authenticated master profile and the existing gateway dispatcher completed the retry
+- the Hermes gateway was not restarted
+
+Deferred:
+- Planning-profile workflow generation
+- multiple specialist steps
+- automatic AUDIT/revision routing
+- Vault learning and reusable workflow versions
+
+Next planned reset:
+- Reset C — Create Work + Planning Profile
+- planned only; requires explicit DV authorization and must not start automatically
 
 ---
 
 ## 6) Where AgentForge is right now
 
 Blunt status:
-- **foundation is real**
-- **the shared task workspace is real on the main port and now includes execution, audit, delegation, memory capture, durable task outputs, ranked relevant context, proposals, approval governance, applied adaptation execution, and a small operator completion loop**
-- but the full canon product is still not complete
+- **the existing persistence, task workspace, audit, memory, and review foundation is real**
+- **one real Hermes execution spine is now proven end to end** through Reset B
+- the broader product is still incomplete: planning, multi-specialist orchestration, independent audit/revision, trusted learning, and reusable workflow versions remain future resets
+- Product Reset A remains the product contract; Reset B is complete and Output Intelligence V2 remains superseded
+- no later reset is authorized automatically
 
 Functional-completion target:
-- AgentForge should feel complete when an operator can open a task, generate the right output with enough context, review suggestions/proposals that meaningfully improve the result or workflow, and close the loop without leaving the shared workspace.
+- AgentForge should feel complete when a user creates work, receives a clear specialist workflow, lets real Hermes profiles execute it, reviews and corrects the delivered artifact, approves trusted learning for the Vault, and can reuse the improved versioned workflow later.
 
 What feels strongest now:
 - task creation
@@ -666,25 +739,34 @@ What is still clearly missing from the canon product:
 
 ## 7) Recommended next build direction
 
-Current recommended next implementation phase:
+### Confirmed next reset stage
+**None automatically. Reset C — Create Work + Planning Profile is planned and awaits explicit DV authorization.**
 
-### Preferred next implementation phase
-**Implementation Phase 20 — Output Intelligence V2**
+Full Reset B–I scope, acceptance gates, verification, architecture rules, and standard DEV prompt:
+- `docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
 
-Reason:
-- tasks now have creation, execution linkage, workspace, audit, delegation, durable memory capture, saved outputs, ranked relevant context, generated/manual proposals, approval governance, applied execution state, and a verified completion loop on the main port
-- the biggest remaining operator pain is not the absence of finish-state controls anymore; it is the amount of manual cleanup still needed before an output feels truly strong
-- Output Intelligence V2 is the best next layer because it improves the quality of the artifact and proposal pairing before the operator reaches the Phase 19 completion gate
-- this keeps the roadmap centered on DV's real product goal: tasks that end with the right output plus useful suggestions inside the same workspace
+Reset B proof now retained:
+1. mission `82661edd618c484a96c7fe11bb3bf787` stores outcome, success criteria, and context
+2. Hermes task `t_ebee2065` is durably mapped on board `agentforge`
+3. real profile `research` completed run `2`
+4. the returned Python.org research artifact includes sources and provenance
+5. blocked-path QA became `Needs Input` with zero artifacts
+6. the artifact entered `Needs Review`
+7. human approval persisted and synchronization preserved `completed`
 
-Output Intelligence V2 should likely add:
-- stronger output generation quality using better packaging of task, vault, and saved-output context
-- better proposal-to-output linkage so revisions are guided by the most relevant improvement note instead of manual cross-checking
-- clearer output quality signals before the operator reaches final completion
-- quality improvements that stay operator-visible and auditable instead of jumping straight to autonomous mutation
+Architecture constraints:
+- use Hermes Kanban through an explicit adapter and durable ID mapping
+- do not write directly to two competing execution state machines
+- do not label AgentForge lifecycle rows or heuristic templates as real worker execution
+- preserve the pre-existing `server.py` working-tree change until its ownership is understood
 
-Alternative after that:
-- deeper Delegation V2 or Proposal Intelligence V2
+Deferred to later explicitly authorized resets:
+- multi-agent workflow generation
+- automatic AUDIT and revision routing
+- reusable workflow creation/versioning
+- approved Vault-learning suggestions
+- the JobForge end-to-end reference workflow
+- main navigation simplification and advanced-module demotion
 
 ---
 
@@ -744,7 +826,7 @@ When continuity drifts:
 
 ## 10) Short canonical summary
 
-AgentForge is a task-centered workforce OS.
+AgentForge is a supervised workflow and memory layer for a persistent team of Hermes specialists.
 
 Current reality:
 - Tasks + Kanban are real
@@ -760,14 +842,19 @@ Current reality:
 - Applied Adaptation Execution V1 is real
 - Proposal Automation V1 is real
 - Functional Completion Loop V1 is now real on the main port
+- Reset B real single-profile Hermes execution is proven on the main port
+
+Approved product loop:
+- `Create Work -> AgentForge designs workflow -> real Hermes specialists execute -> AUDIT/human review -> revision -> approval -> trusted Vault learning -> reusable versioned workflow`
 
 Main missing product layers:
-- deeper vault intelligence beyond heuristic V1 ranking/synthesis
-- stronger output generation quality so the deliverable is closer to the right final answer
-- higher-quality proposal synthesis beyond heuristic V1 generation
-- richer proposal-to-output revision assistance beyond the current manual operator loop
-- deeper delegation/orchestration depth
-- multi-step adaptation orchestration beyond operator-driven V1 execution
+- generated and inspectable specialist workflow plans
+- reliable multi-profile handoffs and quality gates
+- targeted revision routing from human feedback
+- approved learning capture into the Knowledge Vault
+- reusable workflow creation and versioning from successful missions
 
-Current best next step after Phase 19:
-- **Implementation Phase 20 — Output Intelligence V2**
+Current roadmap state:
+- **Reset B — Real Single-Profile Execution Proof: complete**
+- **Reset C — Create Work + Planning Profile: planned, awaiting explicit authorization**
+- full finish line: **6 remaining core build phases (C–H) plus Reset I hardening/completion**
