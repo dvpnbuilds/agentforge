@@ -42,6 +42,7 @@ class MissionServiceTests(unittest.TestCase):
             'desired_outcome': 'Research the current stable Python release.',
             'success_criteria': 'Return version, release date, and two official source URLs.',
             'context': 'Use python.org sources.',
+            'profile': 'research',
             'idempotency_key': 'reset-b-proof-1',
         }
         first = self.service.create_mission(payload)
@@ -65,6 +66,7 @@ class MissionServiceTests(unittest.TestCase):
         mission = self.service.create_mission({
             'desired_outcome': 'Research a private system.',
             'success_criteria': 'Return evidence.',
+            'profile': 'research',
         })
         self.adapter.show_payload = {
             'task': {'id': 't_real', 'status': 'blocked', 'assignee': 'research'},
@@ -79,6 +81,7 @@ class MissionServiceTests(unittest.TestCase):
         mission = self.service.create_mission({
             'desired_outcome': 'Research Python release.',
             'success_criteria': 'Return sourced facts.',
+            'profile': 'research',
         })
         self.adapter.task = {
             'id': 't_real',

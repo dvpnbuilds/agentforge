@@ -29,7 +29,7 @@ HOST = "127.0.0.1"
 PORT = 50000
 STALE_RUNNING_RUN_MAX_AGE_SECONDS = 12 * 60 * 60
 APP_NAME = "AgentForge"
-IMPLEMENTATION_PHASE = "Reset B — Real Single-Profile Execution Proof"
+IMPLEMENTATION_PHASE = "Reset C — Create Work + Planning Profile"
 PROJECT_DIR = Path(__file__).resolve().parent
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/root/.hermes"))
 LIBRARY_ROOT = Path("/root/.hermes/content")
@@ -8792,6 +8792,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.read_payload()
             mission_sync_match = re.fullmatch(r"/api/missions/([^/]+)/sync", parsed.path)
             mission_review_match = re.fullmatch(r"/api/missions/([^/]+)/review", parsed.path)
+            mission_plan_action_match = re.fullmatch(r"/api/missions/([^/]+)/plan-action", parsed.path)
             if parsed.path == "/api/missions":
                 self.send_json({"mission": MISSION_SERVICE.create_mission(payload)}, 201)
                 return
@@ -8800,6 +8801,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if mission_review_match:
                 self.send_json({"mission": MISSION_SERVICE.review_mission(mission_review_match.group(1), payload)})
+                return
+            if mission_plan_action_match:
+                self.send_json({"mission": MISSION_SERVICE.plan_action(mission_plan_action_match.group(1), payload)})
                 return
             if parsed.path == "/api/board":
                 self.send_json({"task": board_create(payload)}, 201)

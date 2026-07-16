@@ -52,13 +52,14 @@ class HermesKanbanAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(KanbanCommandError, 'malformed JSON'):
             adapter.list_tasks()
 
-    def test_show_runs_and_block_commands_are_allowlisted(self):
+    def test_show_runs_block_and_archive_commands_are_allowlisted(self):
         adapter, runner = self.make_adapter(subprocess.CompletedProcess([], 0, stdout=json.dumps({'id': 't_1'}), stderr=''))
         adapter.show_task('t_1')
         adapter.task_runs('t_1')
         adapter.block_task('t_1', 'Need API access')
+        adapter.archive_task('t_1')
         commands = [call.args[0][4] for call in runner.call_args_list]
-        self.assertEqual(commands, ['show', 'runs', 'block'])
+        self.assertEqual(commands, ['show', 'runs', 'block', 'archive'])
 
 
 if __name__ == '__main__':

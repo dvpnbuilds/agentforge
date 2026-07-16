@@ -17,7 +17,7 @@ class HermesKanbanAdapter:
     BOARD = "agentforge"
     MAX_BODY_BYTES = 20_000
     MAX_OUTPUT_BYTES = 2_000_000
-    ALLOWED_PROFILES = frozenset({"research"})
+    ALLOWED_PROFILES = frozenset({"assistant", "research", "planning", "dev", "audit"})
 
     def __init__(
         self,

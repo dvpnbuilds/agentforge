@@ -18,7 +18,7 @@ DEV-ready phase plan: [`docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`](docs/AGENT
 - **AI Ops / snapshot view** is fed by gateway, cron, session, VPS, and kanban snapshot data.
 - **Vault library and knowledge graph** are present.
 
-These surfaces remain the existing foundation. Reset B now adds one deliberately narrow real-execution spine without pretending the full multi-profile product is complete.
+These surfaces remain the existing foundation. Resets B and C add a narrow real-execution spine plus real planning without pretending the full multi-profile product is complete.
 
 ## Reset B — verified real execution proof
 
@@ -46,8 +46,27 @@ API surfaces:
 - `GET /api/missions/:id`
 - `POST /api/missions/:id/sync`
 - `POST /api/missions/:id/review`
+- `POST /api/missions/:id/plan-action`
 
-Reset C is planned but is **not authorized or started automatically**. Output Intelligence V2 remains superseded by the Product Reset roadmap.
+## Reset C — verified real planning workflow
+
+The Tasks screen now defaults to a calm goal-first Create Work path:
+
+- desired outcome and success criteria are required; context, links, attachments, priority, and deadline are supported
+- a real Hermes `planning` task proposes a strict server-validated specialist workflow
+- plans show profile ownership, scoped responsibilities, outputs, dependencies, evidence/tool requirements, final deliverable, and HUMAN/AUDIT gates
+- malformed or unsupported plans fail visibly and can be retried
+- revision feedback creates a new planning task while preserving previous plan versions
+- `Start` approves the plan only; no specialist execution task is created until Reset D
+
+Verified proof retained for DV/AUDIT inspection:
+
+- AgentForge mission: `e68051e454d94999a1eae5c7b43fada5`
+- planning tasks: `t_7b4df93e` (v1) and `t_78efbb68` (v2)
+- final state: plan v2 approved / mission queued
+- v1 revision feedback and explicit v2 AUDIT gate are retained
+
+Reset D is planned but is **not authorized or started automatically**. Output Intelligence V2 remains superseded by the Product Reset roadmap.
 
 ## Runtime
 

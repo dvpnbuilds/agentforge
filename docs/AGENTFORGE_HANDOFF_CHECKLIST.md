@@ -84,7 +84,7 @@ A phase is not really done until:
 
 ---
 
-## Latest handoff — Reset B (2026-07-16)
+## Previous handoff — Reset B (2026-07-16)
 
 - Phase: Reset B — Real Single-Profile Execution Proof
 - Branch: `main`
@@ -99,3 +99,23 @@ A phase is not really done until:
 - Gateway: not restarted
 - Deferred: every Reset C+ capability
 - Next: Reset C is planned but requires explicit DV authorization; do not start automatically
+
+---
+
+## Latest handoff — Reset C (2026-07-16)
+
+- Phase: Reset C — Create Work + Planning Profile
+- Branch: `main`
+- Baseline HEAD: `2cd763c feat(agentforge): complete Reset B real execution proof`
+- Backups:
+  - `backups/index_vreset-c_2026-07-16T14-27.html`
+  - `backups/server_vreset-c_2026-07-16T14-27.py`
+- Runtime: `agentforge.service` active on `127.0.0.1:50000`; implementation phase reports Reset C
+- Proof mission: `e68051e454d94999a1eae5c7b43fada5`
+- Real planning tasks: v1 `t_7b4df93e`; v2 `t_78efbb68`
+- Final proof state: plan v2 approved; mission queued; downstream execution deliberately not dispatched
+- Verification: 18 unit tests, Python/JS syntax, strict plan validation, idempotency, attachment path, malformed/unsupported/cancel/retry paths, real planner, browser revision/approval, browser console, production API/runtime, ordinary 28-task history, and Reset B regression passed
+- Cleanup: canceled temporary mission removed, its Hermes task archived, `/tmp` fixtures removed; successful Reset C proof and attachment retained intentionally
+- Gateway: not restarted
+- Deferred: all Reset D+ execution, automatic audit routing, Vault learning, workflow reuse, JobForge reference flow, and final hardening
+- Next: Reset D is planned but requires explicit DV authorization; do not start automatically

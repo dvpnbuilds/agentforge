@@ -685,14 +685,38 @@ Operational note:
 - the first worker attempt exposed missing research-profile Codex auth; profile-local auth was restored from the already-authenticated master profile and the existing gateway dispatcher completed the retry
 - the Hermes gateway was not restarted
 
+## Reset C — Create Work + Planning Profile — complete (2026-07-16)
+
+Delivered:
+- calm goal-first `Create Work` intake with desired outcome, success criteria, context/links, priority, deadline, and staged attachments
+- advanced implementation details demoted behind `Show Advanced`; no agent choice is required
+- durable real Hermes task dispatch to profile `planning` through the existing safe Kanban adapter
+- AgentForge-owned plan-version persistence with strict server validation for profiles, tools, dependencies, evidence, outputs, and human/audit gates
+- visible specialist stage sequence, mission truth, retry/cancel handling, revision feedback, previous-plan history, and human plan approval
+- approved plans stop at `queued`; downstream specialist dispatch is intentionally deferred to Reset D
+
+Routes / data changes:
+- `POST /api/missions/:id/plan-action`
+- planning fields added to `missions`
+- `execution_plans` table added to AgentForge-owned `board.db`
+- `mission_steps` retains one mapped Hermes planning task per plan version
+
+Verification:
+- 18 adapter/service/planning unit tests pass
+- Python compile and extracted inline-JavaScript syntax checks pass
+- real planning mission `e68051e454d94999a1eae5c7b43fada5` produced plan v1 on task `t_7b4df93e`
+- browser-driven revision feedback produced validated plan v2 on task `t_78efbb68`, preserving v1 and its feedback
+- plan v2 added the requested explicit AUDIT gate and was approved by DV
+- Kanban task count remained unchanged during approval, proving no Reset D execution tasks were dispatched
+- production API, browser, console, ordinary 28-task history, attachment path, validation, blocked/malformed mapping, idempotency, cancel, retry, and Reset B regressions passed
+
 Deferred:
-- Planning-profile workflow generation
-- multiple specialist steps
-- automatic AUDIT/revision routing
+- multi-profile execution of approved plans
+- automatic AUDIT/revision task routing
 - Vault learning and reusable workflow versions
 
 Next planned reset:
-- Reset C — Create Work + Planning Profile
+- Reset D — Multi-Specialist Orchestration
 - planned only; requires explicit DV authorization and must not start automatically
 
 ---
@@ -701,9 +725,9 @@ Next planned reset:
 
 Blunt status:
 - **the existing persistence, task workspace, audit, memory, and review foundation is real**
-- **one real Hermes execution spine is now proven end to end** through Reset B
-- the broader product is still incomplete: planning, multi-specialist orchestration, independent audit/revision, trusted learning, and reusable workflow versions remain future resets
-- Product Reset A remains the product contract; Reset B is complete and Output Intelligence V2 remains superseded
+- **real Hermes research execution and real planning-profile workflow generation are now proven end to end** through Resets B and C
+- the broader product is still incomplete: multi-specialist orchestration, independent audit/revision, trusted learning, and reusable workflow versions remain future resets
+- Product Reset A remains the product contract; Resets B and C are complete and Output Intelligence V2 remains superseded
 - no later reset is authorized automatically
 
 Functional-completion target:
@@ -740,7 +764,7 @@ What is still clearly missing from the canon product:
 ## 7) Recommended next build direction
 
 ### Confirmed next reset stage
-**None automatically. Reset C — Create Work + Planning Profile is planned and awaits explicit DV authorization.**
+**None automatically. Reset D — Multi-Specialist Orchestration is planned and awaits explicit DV authorization.**
 
 Full Reset B–I scope, acceptance gates, verification, architecture rules, and standard DEV prompt:
 - `docs/AGENTFORGE_PRODUCT_RESET_BUILD_PLAN.md`
@@ -753,6 +777,13 @@ Reset B proof now retained:
 5. blocked-path QA became `Needs Input` with zero artifacts
 6. the artifact entered `Needs Review`
 7. human approval persisted and synchronization preserved `completed`
+
+Reset C proof now retained:
+1. planning mission `e68051e454d94999a1eae5c7b43fada5` stores goal-first intake and attachment provenance
+2. real `planning` tasks `t_7b4df93e` and `t_78efbb68` produced validated plan versions 1 and 2
+3. browser-submitted revision feedback is preserved against plan v1
+4. plan v2 includes allowed specialist profiles, dependencies, evidence/tool requirements, and explicit HUMAN/AUDIT gates
+5. DV approval moved the mission to `queued` without creating any downstream execution task
 
 Architecture constraints:
 - use Hermes Kanban through an explicit adapter and durable ID mapping
@@ -848,7 +879,6 @@ Approved product loop:
 - `Create Work -> AgentForge designs workflow -> real Hermes specialists execute -> AUDIT/human review -> revision -> approval -> trusted Vault learning -> reusable versioned workflow`
 
 Main missing product layers:
-- generated and inspectable specialist workflow plans
 - reliable multi-profile handoffs and quality gates
 - targeted revision routing from human feedback
 - approved learning capture into the Knowledge Vault
@@ -856,5 +886,5 @@ Main missing product layers:
 
 Current roadmap state:
 - **Reset B — Real Single-Profile Execution Proof: complete**
-- **Reset C — Create Work + Planning Profile: planned, awaiting explicit authorization**
-- full finish line: **6 remaining core build phases (C–H) plus Reset I hardening/completion**
+- **Reset C — Create Work + Planning Profile: complete**
+- full finish line: **5 remaining core build phases (D–H) plus Reset I hardening/completion**

@@ -1,7 +1,7 @@
 # AgentForge Product Reset — DEV Build Plan
 
 Date: 2026-07-16
-Status: Reset B implemented and verified on 2026-07-16; Reset C remains planned and requires explicit DV authorization
+Status: Resets B and C implemented and verified on 2026-07-16; Reset D remains planned and requires explicit DV authorization
 Continuity sources:
 
 1. `docs/AGENTFORGE_PHASE_CANON.md`
@@ -170,13 +170,13 @@ Operational note: the first worker attempt exposed missing profile-local Codex c
 
 Temporary blocked-path and deletion-cleanup QA records were removed; the blocked Hermes fixture task was archived. The successful proof mission remains intentionally retained.
 
-**Do not start Reset C without explicit DV authorization.**
+DV explicitly authorized Reset C on 2026-07-16; implementation and verification are recorded below.
 
 ---
 
 # Reset C — Create Work + Planning Profile
 
-Status: Planned
+Status: **Complete — implementation and real-planner proof verified 2026-07-16**
 
 ## Objective
 
@@ -226,6 +226,20 @@ Replace manual technical task setup with a calm goal-first intake and a real PLA
 - Valid plan, malformed plan, unsupported profile, missing success criteria, and attachment paths.
 - Browser QA of create -> planning -> proposed plan -> revision/start.
 - No execution step appears on Hermes Kanban before plan approval except the planning task itself.
+
+## Implemented and verified evidence
+
+- Goal-first intake, optional priority/deadline, attachments, and demoted Advanced details are live on the Tasks screen.
+- `POST /api/missions/:id/plan-action` supports safe `start`, `request_revision`, `cancel`, and `retry` transitions.
+- Strict validation rejects malformed plan JSON, unsupported profiles/tools, unknown dependencies, dependency cycles, missing evidence, and missing HUMAN gates.
+- `execution_plans` preserves versioned structured plans, revision feedback, planner task provenance, and approval state.
+- Real mission `e68051e454d94999a1eae5c7b43fada5` produced plan v1 through planning task `t_7b4df93e`.
+- Browser-submitted revision feedback produced plan v2 through planning task `t_78efbb68`; v1 and feedback remained visible.
+- Plan v2 added an explicit AUDIT gate and was approved; mission state became `queued` with no new Hermes task created during approval.
+- Verification passed: 18 unit tests, Python/JS syntax, API validation/idempotency, attachment path safety, malformed/unsupported/cancel/retry paths, real planner, browser revision/approval, browser console, production runtime, ordinary Tasks history, and Reset B regression.
+- Temporary canceled QA mission was removed and its Hermes planning task archived. Successful Reset C proof remains intentionally retained.
+
+**Do not start Reset D without explicit DV authorization.**
 
 ---
 
